@@ -1,0 +1,78 @@
+2026-02-26 14:15:28,438 - INFO - Лог-файл этой симуляции: logs\sim_20260226_141528.log
+2026-02-26 14:15:28,439 - INFO - ============================================================
+2026-02-26 14:15:28,439 - INFO - НАЧАЛО СИМУЛЯЦИИ
+2026-02-26 14:15:28,439 - INFO - Режим: random
+2026-02-26 14:15:28,439 - INFO - Модуляция: PSK-8, Код Грея: True
+2026-02-26 14:15:28,439 - INFO - Кодирование: hamming (7,4), скорость=0.571
+2026-02-26 14:15:28,439 - INFO - Диапазон Eb/N0: 0.0..10.0 дБ, шаг 1.0
+2026-02-26 14:15:28,439 - INFO - ============================================================
+2026-02-26 14:15:28,440 - INFO - ================================================================================
+2026-02-26 14:15:28,441 - INFO - НОВАЯ СИМУЛЯЦИЯ
+2026-02-26 14:15:28,441 - INFO - Режим: random
+2026-02-26 14:15:28,441 - INFO - Модуляция: PSK-8, Код Грея: True
+2026-02-26 14:15:28,441 - INFO - Кодирование: hamming (7,4), скорость=0.571
+2026-02-26 14:15:28,441 - INFO - Каналы: AWGN
+2026-02-26 14:15:28,441 - INFO - Длина данных: 100000 бит
+2026-02-26 14:15:28,441 - INFO - Диапазон Eb/N0: 0.0..10.0 дБ, шаг 1.0
+2026-02-26 14:15:28,441 - INFO - ================================================================================
+2026-02-26 14:15:28,629 - INFO - Eb/N0=0.00 dB | Es/N0=2.34 dB | Mod=PSKModulator-8 | Gray=True | CodeRate=0.571 | Bits=100000 | BitErrors=18959 | BER=1.896e-01 | SER=5.002e-01 | CorrectedErrors=19304 | DetectedErrors=0 | Blocks=25001 | Channels=['AWGN']
+2026-02-26 14:15:28,826 - INFO - Eb/N0=0.00 dB | Es/N0=2.34 dB | Mod=PSKModulator-8 | Gray=True | CodeRate=0.571 | Bits=100000 | BitErrors=19146 | BER=1.915e-01 | SER=5.013e-01 | CorrectedErrors=19342 | DetectedErrors=0 | Blocks=25001 | Channels=['AWGN']
+2026-02-26 14:15:29,012 - INFO - Eb/N0=0.00 dB | Es/N0=2.34 dB | Mod=PSKModulator-8 | Gray=True | CodeRate=0.571 | Bits=100000 | BitErrors=18966 | BER=1.897e-01 | SER=5.031e-01 | CorrectedErrors=19341 | DetectedErrors=0 | Blocks=25001 | Channels=['AWGN']
+2026-02-26 14:15:29,201 - INFO - Eb/N0=0.00 dB | Es/N0=2.34 dB | Mod=PSKModulator-8 | Gray=True | CodeRate=0.571 | Bits=100000 | BitErrors=19309 | BER=1.931e-01 | SER=5.064e-01 | CorrectedErrors=19344 | DetectedErrors=0 | Blocks=25001 | Channels=['AWGN']
+2026-02-26 14:15:29,390 - INFO - Eb/N0=0.00 dB | Es/N0=2.34 dB | Mod=PSKModulator-8 | Gray=True | CodeRate=0.571 | Bits=100000 | BitErrors=19287 | BER=1.929e-01 | SER=5.026e-01 | CorrectedErrors=19336 | DetectedErrors=0 | Blocks=25001 | Channels=['AWGN']
+2026-02-26 14:15:29,579 - INFO - Eb/N0=1.00 dB | Es/N0=3.34 dB | Mod=PSKModulator-8 | Gray=True | CodeRate=0.571 | Bits=100000 | BitErrors=17711 | BER=1.771e-01 | SER=4.836e-01 | CorrectedErrors=19016 | DetectedErrors=0 | Blocks=25001 | Channels=['AWGN']
+2026-02-26 14:15:29,766 - INFO - Eb/N0=1.00 dB | Es/N0=3.34 dB | Mod=PSKModulator-8 | Gray=True | CodeRate=0.571 | Bits=100000 | BitErrors=17274 | BER=1.727e-01 | SER=4.808e-01 | CorrectedErrors=18965 | DetectedErrors=0 | Blocks=25001 | Channels=['AWGN']
+2026-02-26 14:15:29,951 - INFO - Eb/N0=1.00 dB | Es/N0=3.34 dB | Mod=PSKModulator-8 | Gray=True | CodeRate=0.571 | Bits=100000 | BitErrors=17642 | BER=1.764e-01 | SER=4.833e-01 | CorrectedErrors=18963 | DetectedErrors=0 | Blocks=25001 | Channels=['AWGN']
+2026-02-26 14:15:30,140 - INFO - Eb/N0=1.00 dB | Es/N0=3.34 dB | Mod=PSKModulator-8 | Gray=True | CodeRate=0.571 | Bits=100000 | BitErrors=17811 | BER=1.781e-01 | SER=4.833e-01 | CorrectedErrors=18800 | DetectedErrors=0 | Blocks=25001 | Channels=['AWGN']
+2026-02-26 14:15:30,328 - INFO - Eb/N0=1.00 dB | Es/N0=3.34 dB | Mod=PSKModulator-8 | Gray=True | CodeRate=0.571 | Bits=100000 | BitErrors=17678 | BER=1.768e-01 | SER=4.841e-01 | CorrectedErrors=19023 | DetectedErrors=0 | Blocks=25001 | Channels=['AWGN']
+2026-02-26 14:15:30,519 - INFO - Eb/N0=2.00 dB | Es/N0=4.34 dB | Mod=PSKModulator-8 | Gray=True | CodeRate=0.571 | Bits=100000 | BitErrors=15815 | BER=1.582e-01 | SER=4.591e-01 | CorrectedErrors=18413 | DetectedErrors=0 | Blocks=25001 | Channels=['AWGN']
+2026-02-26 14:15:30,710 - INFO - Eb/N0=2.00 dB | Es/N0=4.34 dB | Mod=PSKModulator-8 | Gray=True | CodeRate=0.571 | Bits=100000 | BitErrors=15427 | BER=1.543e-01 | SER=4.538e-01 | CorrectedErrors=18288 | DetectedErrors=0 | Blocks=25001 | Channels=['AWGN']
+2026-02-26 14:15:30,899 - INFO - Eb/N0=2.00 dB | Es/N0=4.34 dB | Mod=PSKModulator-8 | Gray=True | CodeRate=0.571 | Bits=100000 | BitErrors=15679 | BER=1.568e-01 | SER=4.598e-01 | CorrectedErrors=18488 | DetectedErrors=0 | Blocks=25001 | Channels=['AWGN']
+2026-02-26 14:15:31,097 - INFO - Eb/N0=2.00 dB | Es/N0=4.34 dB | Mod=PSKModulator-8 | Gray=True | CodeRate=0.571 | Bits=100000 | BitErrors=15615 | BER=1.562e-01 | SER=4.566e-01 | CorrectedErrors=18412 | DetectedErrors=0 | Blocks=25001 | Channels=['AWGN']
+2026-02-26 14:15:31,284 - INFO - Eb/N0=2.00 dB | Es/N0=4.34 dB | Mod=PSKModulator-8 | Gray=True | CodeRate=0.571 | Bits=100000 | BitErrors=15558 | BER=1.556e-01 | SER=4.545e-01 | CorrectedErrors=18313 | DetectedErrors=0 | Blocks=25001 | Channels=['AWGN']
+2026-02-26 14:15:31,480 - INFO - Eb/N0=3.00 dB | Es/N0=5.34 dB | Mod=PSKModulator-8 | Gray=True | CodeRate=0.571 | Bits=100000 | BitErrors=13198 | BER=1.320e-01 | SER=4.219e-01 | CorrectedErrors=17537 | DetectedErrors=0 | Blocks=25001 | Channels=['AWGN']
+2026-02-26 14:15:31,672 - INFO - Eb/N0=3.00 dB | Es/N0=5.34 dB | Mod=PSKModulator-8 | Gray=True | CodeRate=0.571 | Bits=100000 | BitErrors=12976 | BER=1.298e-01 | SER=4.180e-01 | CorrectedErrors=17471 | DetectedErrors=0 | Blocks=25001 | Channels=['AWGN']
+2026-02-26 14:15:31,869 - INFO - Eb/N0=3.00 dB | Es/N0=5.34 dB | Mod=PSKModulator-8 | Gray=True | CodeRate=0.571 | Bits=100000 | BitErrors=12888 | BER=1.289e-01 | SER=4.170e-01 | CorrectedErrors=17479 | DetectedErrors=0 | Blocks=25001 | Channels=['AWGN']
+2026-02-26 14:15:32,057 - INFO - Eb/N0=3.00 dB | Es/N0=5.34 dB | Mod=PSKModulator-8 | Gray=True | CodeRate=0.571 | Bits=100000 | BitErrors=12950 | BER=1.295e-01 | SER=4.176e-01 | CorrectedErrors=17463 | DetectedErrors=0 | Blocks=25001 | Channels=['AWGN']
+2026-02-26 14:15:32,249 - INFO - Eb/N0=3.00 dB | Es/N0=5.34 dB | Mod=PSKModulator-8 | Gray=True | CodeRate=0.571 | Bits=100000 | BitErrors=13213 | BER=1.321e-01 | SER=4.214e-01 | CorrectedErrors=17579 | DetectedErrors=0 | Blocks=25001 | Channels=['AWGN']
+2026-02-26 14:15:32,458 - INFO - Eb/N0=4.00 dB | Es/N0=6.34 dB | Mod=PSKModulator-8 | Gray=True | CodeRate=0.571 | Bits=100000 | BitErrors=10282 | BER=1.028e-01 | SER=3.728e-01 | CorrectedErrors=16268 | DetectedErrors=0 | Blocks=25001 | Channels=['AWGN']
+2026-02-26 14:15:32,659 - INFO - Eb/N0=4.00 dB | Es/N0=6.34 dB | Mod=PSKModulator-8 | Gray=True | CodeRate=0.571 | Bits=100000 | BitErrors=10276 | BER=1.028e-01 | SER=3.760e-01 | CorrectedErrors=16396 | DetectedErrors=0 | Blocks=25001 | Channels=['AWGN']
+2026-02-26 14:15:33,087 - INFO - Eb/N0=4.00 dB | Es/N0=6.34 dB | Mod=PSKModulator-8 | Gray=True | CodeRate=0.571 | Bits=100000 | BitErrors=10257 | BER=1.026e-01 | SER=3.750e-01 | CorrectedErrors=16281 | DetectedErrors=0 | Blocks=25001 | Channels=['AWGN']
+2026-02-26 14:15:33,855 - INFO - Eb/N0=4.00 dB | Es/N0=6.34 dB | Mod=PSKModulator-8 | Gray=True | CodeRate=0.571 | Bits=100000 | BitErrors=10258 | BER=1.026e-01 | SER=3.752e-01 | CorrectedErrors=16224 | DetectedErrors=0 | Blocks=25001 | Channels=['AWGN']
+2026-02-26 14:15:34,305 - INFO - Eb/N0=4.00 dB | Es/N0=6.34 dB | Mod=PSKModulator-8 | Gray=True | CodeRate=0.571 | Bits=100000 | BitErrors=10136 | BER=1.014e-01 | SER=3.716e-01 | CorrectedErrors=16187 | DetectedErrors=0 | Blocks=25001 | Channels=['AWGN']
+2026-02-26 14:15:34,575 - INFO - Eb/N0=5.00 dB | Es/N0=7.34 dB | Mod=PSKModulator-8 | Gray=True | CodeRate=0.571 | Bits=100000 | BitErrors=7086 | BER=7.086e-02 | SER=3.109e-01 | CorrectedErrors=14208 | DetectedErrors=0 | Blocks=25001 | Channels=['AWGN']
+2026-02-26 14:15:34,777 - INFO - Eb/N0=5.00 dB | Es/N0=7.34 dB | Mod=PSKModulator-8 | Gray=True | CodeRate=0.571 | Bits=100000 | BitErrors=6897 | BER=6.897e-02 | SER=3.102e-01 | CorrectedErrors=14218 | DetectedErrors=0 | Blocks=25001 | Channels=['AWGN']
+2026-02-26 14:15:34,977 - INFO - Eb/N0=5.00 dB | Es/N0=7.34 dB | Mod=PSKModulator-8 | Gray=True | CodeRate=0.571 | Bits=100000 | BitErrors=7058 | BER=7.058e-02 | SER=3.127e-01 | CorrectedErrors=14275 | DetectedErrors=0 | Blocks=25001 | Channels=['AWGN']
+2026-02-26 14:15:35,167 - INFO - Eb/N0=5.00 dB | Es/N0=7.34 dB | Mod=PSKModulator-8 | Gray=True | CodeRate=0.571 | Bits=100000 | BitErrors=6952 | BER=6.952e-02 | SER=3.135e-01 | CorrectedErrors=14391 | DetectedErrors=0 | Blocks=25001 | Channels=['AWGN']
+2026-02-26 14:15:35,357 - INFO - Eb/N0=5.00 dB | Es/N0=7.34 dB | Mod=PSKModulator-8 | Gray=True | CodeRate=0.571 | Bits=100000 | BitErrors=6935 | BER=6.935e-02 | SER=3.107e-01 | CorrectedErrors=14279 | DetectedErrors=0 | Blocks=25001 | Channels=['AWGN']
+2026-02-26 14:15:35,545 - INFO - Eb/N0=6.00 dB | Es/N0=8.34 dB | Mod=PSKModulator-8 | Gray=True | CodeRate=0.571 | Bits=100000 | BitErrors=3812 | BER=3.812e-02 | SER=2.330e-01 | CorrectedErrors=11357 | DetectedErrors=0 | Blocks=25001 | Channels=['AWGN']
+2026-02-26 14:15:35,733 - INFO - Eb/N0=6.00 dB | Es/N0=8.34 dB | Mod=PSKModulator-8 | Gray=True | CodeRate=0.571 | Bits=100000 | BitErrors=3945 | BER=3.945e-02 | SER=2.345e-01 | CorrectedErrors=11413 | DetectedErrors=0 | Blocks=25001 | Channels=['AWGN']
+2026-02-26 14:15:35,919 - INFO - Eb/N0=6.00 dB | Es/N0=8.34 dB | Mod=PSKModulator-8 | Gray=True | CodeRate=0.571 | Bits=100000 | BitErrors=3904 | BER=3.904e-02 | SER=2.371e-01 | CorrectedErrors=11535 | DetectedErrors=0 | Blocks=25001 | Channels=['AWGN']
+2026-02-26 14:15:36,111 - INFO - Eb/N0=6.00 dB | Es/N0=8.34 dB | Mod=PSKModulator-8 | Gray=True | CodeRate=0.571 | Bits=100000 | BitErrors=3946 | BER=3.946e-02 | SER=2.364e-01 | CorrectedErrors=11457 | DetectedErrors=0 | Blocks=25001 | Channels=['AWGN']
+2026-02-26 14:15:36,299 - INFO - Eb/N0=6.00 dB | Es/N0=8.34 dB | Mod=PSKModulator-8 | Gray=True | CodeRate=0.571 | Bits=100000 | BitErrors=3804 | BER=3.804e-02 | SER=2.356e-01 | CorrectedErrors=11529 | DetectedErrors=0 | Blocks=25001 | Channels=['AWGN']
+2026-02-26 14:15:36,488 - INFO - Eb/N0=7.00 dB | Es/N0=9.34 dB | Mod=PSKModulator-8 | Gray=True | CodeRate=0.571 | Bits=100000 | BitErrors=1554 | BER=1.554e-02 | SER=1.497e-01 | CorrectedErrors=7779 | DetectedErrors=0 | Blocks=25001 | Channels=['AWGN']
+2026-02-26 14:15:36,672 - INFO - Eb/N0=7.00 dB | Es/N0=9.34 dB | Mod=PSKModulator-8 | Gray=True | CodeRate=0.571 | Bits=100000 | BitErrors=1515 | BER=1.515e-02 | SER=1.461e-01 | CorrectedErrors=7622 | DetectedErrors=0 | Blocks=25001 | Channels=['AWGN']
+2026-02-26 14:15:36,857 - INFO - Eb/N0=7.00 dB | Es/N0=9.34 dB | Mod=PSKModulator-8 | Gray=True | CodeRate=0.571 | Bits=100000 | BitErrors=1507 | BER=1.507e-02 | SER=1.459e-01 | CorrectedErrors=7577 | DetectedErrors=0 | Blocks=25001 | Channels=['AWGN']
+2026-02-26 14:15:37,046 - INFO - Eb/N0=7.00 dB | Es/N0=9.34 dB | Mod=PSKModulator-8 | Gray=True | CodeRate=0.571 | Bits=100000 | BitErrors=1490 | BER=1.490e-02 | SER=1.469e-01 | CorrectedErrors=7656 | DetectedErrors=0 | Blocks=25001 | Channels=['AWGN']
+2026-02-26 14:15:37,232 - INFO - Eb/N0=7.00 dB | Es/N0=9.34 dB | Mod=PSKModulator-8 | Gray=True | CodeRate=0.571 | Bits=100000 | BitErrors=1471 | BER=1.471e-02 | SER=1.468e-01 | CorrectedErrors=7677 | DetectedErrors=0 | Blocks=25001 | Channels=['AWGN']
+2026-02-26 14:15:37,424 - INFO - Eb/N0=8.00 dB | Es/N0=10.34 dB | Mod=PSKModulator-8 | Gray=True | CodeRate=0.571 | Bits=100000 | BitErrors=271 | BER=2.710e-03 | SER=6.050e-02 | CorrectedErrors=3366 | DetectedErrors=0 | Blocks=25001 | Channels=['AWGN']
+2026-02-26 14:15:37,608 - INFO - Eb/N0=8.00 dB | Es/N0=10.34 dB | Mod=PSKModulator-8 | Gray=True | CodeRate=0.571 | Bits=100000 | BitErrors=241 | BER=2.410e-03 | SER=5.942e-02 | CorrectedErrors=3320 | DetectedErrors=0 | Blocks=25001 | Channels=['AWGN']
+2026-02-26 14:15:37,792 - INFO - Eb/N0=8.00 dB | Es/N0=10.34 dB | Mod=PSKModulator-8 | Gray=True | CodeRate=0.571 | Bits=100000 | BitErrors=260 | BER=2.600e-03 | SER=6.022e-02 | CorrectedErrors=3352 | DetectedErrors=0 | Blocks=25001 | Channels=['AWGN']
+2026-02-26 14:15:37,979 - INFO - Eb/N0=8.00 dB | Es/N0=10.34 dB | Mod=PSKModulator-8 | Gray=True | CodeRate=0.571 | Bits=100000 | BitErrors=279 | BER=2.790e-03 | SER=6.127e-02 | CorrectedErrors=3408 | DetectedErrors=0 | Blocks=25001 | Channels=['AWGN']
+2026-02-26 14:15:38,171 - INFO - Eb/N0=8.00 dB | Es/N0=10.34 dB | Mod=PSKModulator-8 | Gray=True | CodeRate=0.571 | Bits=100000 | BitErrors=236 | BER=2.360e-03 | SER=6.024e-02 | CorrectedErrors=3357 | DetectedErrors=0 | Blocks=25001 | Channels=['AWGN']
+2026-02-26 14:15:38,355 - INFO - Eb/N0=9.00 dB | Es/N0=11.34 dB | Mod=PSKModulator-8 | Gray=True | CodeRate=0.571 | Bits=100000 | BitErrors=3 | BER=3.000e-05 | SER=9.891e-03 | CorrectedErrors=574 | DetectedErrors=0 | Blocks=25001 | Channels=['AWGN']
+2026-02-26 14:15:38,543 - INFO - Eb/N0=9.00 dB | Es/N0=11.34 dB | Mod=PSKModulator-8 | Gray=True | CodeRate=0.571 | Bits=100000 | BitErrors=2 | BER=2.000e-05 | SER=9.257e-03 | CorrectedErrors=539 | DetectedErrors=0 | Blocks=25001 | Channels=['AWGN']
+2026-02-26 14:15:38,728 - INFO - Eb/N0=9.00 dB | Es/N0=11.34 dB | Mod=PSKModulator-8 | Gray=True | CodeRate=0.571 | Bits=100000 | BitErrors=2 | BER=2.000e-05 | SER=8.914e-03 | CorrectedErrors=519 | DetectedErrors=0 | Blocks=25001 | Channels=['AWGN']
+2026-02-26 14:15:38,910 - INFO - Eb/N0=9.00 dB | Es/N0=11.34 dB | Mod=PSKModulator-8 | Gray=True | CodeRate=0.571 | Bits=100000 | BitErrors=6 | BER=6.000e-05 | SER=9.617e-03 | CorrectedErrors=557 | DetectedErrors=0 | Blocks=25001 | Channels=['AWGN']
+2026-02-26 14:15:39,104 - INFO - Eb/N0=9.00 dB | Es/N0=11.34 dB | Mod=PSKModulator-8 | Gray=True | CodeRate=0.571 | Bits=100000 | BitErrors=14 | BER=1.400e-04 | SER=9.446e-03 | CorrectedErrors=544 | DetectedErrors=0 | Blocks=25001 | Channels=['AWGN']
+2026-02-26 14:15:39,288 - INFO - Eb/N0=10.00 dB | Es/N0=12.34 dB | Mod=PSKModulator-8 | Gray=True | CodeRate=0.571 | Bits=100000 | BitErrors=0 | BER=0.000e+00 | SER=6.857e-05 | CorrectedErrors=4 | DetectedErrors=0 | Blocks=25001 | Channels=['AWGN']
+2026-02-26 14:15:39,469 - INFO - Eb/N0=10.00 dB | Es/N0=12.34 dB | Mod=PSKModulator-8 | Gray=True | CodeRate=0.571 | Bits=100000 | BitErrors=0 | BER=0.000e+00 | SER=6.857e-05 | CorrectedErrors=4 | DetectedErrors=0 | Blocks=25001 | Channels=['AWGN']
+2026-02-26 14:15:39,653 - INFO - Eb/N0=10.00 dB | Es/N0=12.34 dB | Mod=PSKModulator-8 | Gray=True | CodeRate=0.571 | Bits=100000 | BitErrors=0 | BER=0.000e+00 | SER=1.029e-04 | CorrectedErrors=6 | DetectedErrors=0 | Blocks=25001 | Channels=['AWGN']
+2026-02-26 14:15:39,839 - INFO - Eb/N0=10.00 dB | Es/N0=12.34 dB | Mod=PSKModulator-8 | Gray=True | CodeRate=0.571 | Bits=100000 | BitErrors=0 | BER=0.000e+00 | SER=1.029e-04 | CorrectedErrors=6 | DetectedErrors=0 | Blocks=25001 | Channels=['AWGN']
+2026-02-26 14:15:40,021 - INFO - Eb/N0=10.00 dB | Es/N0=12.34 dB | Mod=PSKModulator-8 | Gray=True | CodeRate=0.571 | Bits=100000 | BitErrors=0 | BER=0.000e+00 | SER=6.857e-05 | CorrectedErrors=4 | DetectedErrors=0 | Blocks=25001 | Channels=['AWGN']
+2026-02-26 14:15:40,022 - INFO - Результаты сохранены в файл: results_PSK8_Random_20260226_141540.txt
+2026-02-26 14:15:40,022 - INFO - ============================================================
+2026-02-26 14:15:40,022 - INFO - СИМУЛЯЦИЯ ЗАВЕРШЕНА за 11.6 с
+2026-02-26 14:15:40,022 - INFO - Результаты сохранены в results_PSK8_Random_20260226_141540.txt
+2026-02-26 14:15:40,022 - INFO - ============================================================
+2026-02-26 14:15:40,376 - INFO - График сохранён: Plot_PSK8_Random_20260226_141540.png
