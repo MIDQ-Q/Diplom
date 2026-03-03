@@ -60,6 +60,7 @@ from simulation import (
     simulate_text_transmission,
     save_results_to_text,
     plot_and_save_results,
+    plot_comparison,
     results_manager,
 )
 from results_manager import _to_python  # для JSON-экспорта
@@ -171,6 +172,19 @@ class SimulationGUI:
         self.per_enabled_var  = tk.BooleanVar(value=False)
         self.per_packet_var   = tk.StringVar(value="1024")
 
+        # Шифрование
+        self.enc_enabled_var  = tk.BooleanVar(value=False)
+        self.enc_type_var     = tk.StringVar(value="aes")
+        self.enc_aes_mode_var = tk.StringVar(value="CBC")
+        self.enc_key_var      = tk.StringVar(value="")
+
+        # Перемежение
+        self.il_enabled_var   = tk.BooleanVar(value=False)
+        self.il_depth_var     = tk.StringVar(value="8")
+        # Восстановление текста
+        self.tr_enabled_var   = tk.BooleanVar(value=False)
+        self.tr_window_var    = tk.StringVar(value="3")
+
         self.queue           = queue.Queue()
         self.progress_var    = tk.DoubleVar(value=0.0)
         self.progress_label_var = tk.StringVar(value="Готов")
@@ -279,9 +293,11 @@ class SimulationGUI:
         tabs = [
             ("📊 Данные",      self._build_data_tab),
             ("🔐 Кодирование", self._build_coding_tab),
+            ("🔒 Шифрование",  self._build_encryption_tab),
             ("📡 Модуляция",   self._build_mod_tab),
             ("📶 Канал",       self._build_channel_tab),
             ("📈 Графики",     self._build_plot_tab),
+            ("🔀 Перемежение",  self._build_interleaving_tab),
         ]
         for title, builder in tabs:
             tab = ttk.Frame(nb)
@@ -322,6 +338,8 @@ class SimulationGUI:
         ttk.Button(left_ctrl, text="💾 Сохранить", command=self.save_results).pack(side=tk.LEFT, padx=4)
         ttk.Button(left_ctrl, text="🗑 Очистить",  command=self.clear_results).pack(side=tk.LEFT, padx=4)
         ttk.Button(left_ctrl, text="📊 Экспорт",   command=self.export_results).pack(side=tk.LEFT, padx=4)
+        ttk.Button(left_ctrl, text="📁 CSV",        command=self.export_csv).pack(side=tk.LEFT, padx=4)
+        ttk.Button(left_ctrl, text="🔀 Сравнить",  command=self.compare_runs).pack(side=tk.LEFT, padx=4)
 
         right_ctrl = ttk.Frame(ctrl_f, style="Dark.TFrame")
         right_ctrl.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=(20, 0))
@@ -452,6 +470,93 @@ class SimulationGUI:
                         "  • Лучшая помехоустойчивость\n"
                         "  • Скорость ≈ 1/3 (медленнее)"),
                   justify=tk.LEFT, foreground=ACCENT_YELLOW).pack(anchor=tk.W, padx=15, pady=8)
+
+
+    def _build_encryption_tab(self, parent: ttk.Frame) -> None:
+        """Вкладка настроек шифрования."""
+        import os as _os
+        from encryption import aes_available as _aes_ok
+
+        # ── Включить / выключить ─────────────────────────────────────────────
+        ttk.Checkbutton(parent, text="✓ Включить шифрование",
+                        variable=self.enc_enabled_var).pack(
+            anchor=tk.W, padx=15, pady=(12, 6))
+
+        # ── Алгоритм ─────────────────────────────────────────────────────────
+        alg_f = ttk.LabelFrame(parent, text="Алгоритм", padding=8)
+        alg_f.pack(fill=tk.X, padx=15, pady=(0, 8))
+
+        ttk.Radiobutton(alg_f, text="🔑 XOR-шифр (учебный, нет распространения ошибок)",
+                        variable=self.enc_type_var, value="xor").pack(
+            anchor=tk.W, pady=2)
+
+        aes_rb = ttk.Radiobutton(
+            alg_f,
+            text="🔒 AES-128 (стандарт)" + ("" if _aes_ok() else "  ⚠ недоступен"),
+            variable=self.enc_type_var, value="aes",
+            state=tk.NORMAL if _aes_ok() else tk.DISABLED,
+        )
+        aes_rb.pack(anchor=tk.W, pady=2)
+
+        # ── Режим AES ────────────────────────────────────────────────────────
+        mode_f = ttk.LabelFrame(parent, text="Режим AES", padding=8)
+        mode_f.pack(fill=tk.X, padx=15, pady=(0, 8))
+
+        modes_info = [
+            ("ECB", "ECB  — независимые блоки, нет распространения ошибок"),
+            ("CBC", "CBC  — цепочка, ошибка разрушает 1 блок + 1 бит следующего"),
+            ("CTR", "CTR  — потоковый режим, нет распространения ошибок"),
+        ]
+        for val, text in modes_info:
+            ttk.Radiobutton(mode_f, text=text,
+                            variable=self.enc_aes_mode_var, value=val).pack(
+                anchor=tk.W, pady=2)
+
+        def _toggle_mode_frame(*_):
+            if self.enc_type_var.get() == "aes":
+                mode_f.pack(fill=tk.X, padx=15, pady=(0, 8))
+            else:
+                mode_f.pack_forget()
+
+        self.enc_type_var.trace_add("write", _toggle_mode_frame)
+        _toggle_mode_frame()
+
+        # ── Ключ ─────────────────────────────────────────────────────────────
+        key_f = ttk.LabelFrame(parent, text="Ключ шифрования", padding=8)
+        key_f.pack(fill=tk.X, padx=15, pady=(0, 8))
+
+        ttk.Label(key_f, text="Hex (32 символа = 128 бит):").grid(
+            row=0, column=0, sticky=tk.W, pady=(0, 4))
+
+        key_entry = ttk.Entry(key_f, textvariable=self.enc_key_var, width=34,
+                              font=("Courier", 9))
+        key_entry.grid(row=1, column=0, columnspan=2, sticky=tk.EW, pady=(0, 6))
+        key_f.columnconfigure(0, weight=1)
+
+        def _gen_key():
+            self.enc_key_var.set(_os.urandom(16).hex())
+
+        ttk.Button(key_f, text="🎲 Случайный ключ", command=_gen_key).grid(
+            row=2, column=0, sticky=tk.W)
+
+        ttk.Label(key_f,
+                  text="Пусто → новый случайный ключ на каждый прогон",
+                  foreground=ACCENT_YELLOW, font=("Segoe UI", 8)).grid(
+            row=3, column=0, columnspan=2, sticky=tk.W, pady=(4, 0))
+
+        # ── Справка ──────────────────────────────────────────────────────────
+        ttk.Label(parent,
+                  text=("Шифрование применяется ДО кодирования:\n"
+                        "  данные → шифр → кодер → канал → декодер → дешифр\n\n"
+                        "Метрики после включения:\n"
+                        "  BER pre-decrypt  — ошибки канала (до дешифровки)\n"
+                        "  BER post-decrypt — итоговый BER (основной)\n"
+                        "  Распр. ошибок    — BER_post / BER_pre\n"
+                        "  AES блок-ошибки  — повреждённых 128-бит блоков\n\n"
+                        "ECB и CTR: распр. ≈ 1.0\n"
+                        "CBC: распр. > 1.0 при средних SNR (лавинный эффект)"),
+                  justify=tk.LEFT,
+                  foreground=ACCENT_YELLOW).pack(anchor=tk.W, padx=15, pady=8)
 
     def _build_mod_tab(self, parent: ttk.Frame) -> None:
         ttk.Label(parent, text="Тип модуляции:", style="Title.TLabel").pack(
@@ -585,6 +690,234 @@ class SimulationGUI:
         self.channel_vars["impulse_width_from"] = wf_var
         self.channel_vars["impulse_width_to"]   = wt_var
 
+
+    def _build_interleaving_tab(self, parent: ttk.Frame) -> None:
+        """Вкладка «Перемежение и восстановление текста»."""
+        # ── Интерливер ──────────────────────────────────────────────────────
+        il_f = ttk.LabelFrame(parent, text="🔀 Блочный интерливер", padding=10)
+        il_f.pack(fill=tk.X, padx=10, pady=(12, 8))
+
+        ttk.Checkbutton(
+            il_f, text="✓ Включить перемежение",
+            variable=self.il_enabled_var,
+        ).grid(row=0, column=0, columnspan=3, sticky=tk.W, pady=(0, 8))
+
+        ttk.Label(il_f, text="Глубина (depth):").grid(row=1, column=0, sticky=tk.W, pady=4)
+        depth_cb = ttk.Combobox(
+            il_f, textvariable=self.il_depth_var,
+            values=["4", "8", "16", "32"], state="readonly", width=8,
+        )
+        depth_cb.grid(row=1, column=1, padx=8, sticky=tk.W)
+        ttk.Label(il_f, text="бит", foreground=ACCENT_YELLOW,
+                  font=("Segoe UI", 8)).grid(row=1, column=2, sticky=tk.W)
+
+        ttk.Label(
+            il_f,
+            text=(
+                "Матрица записывается по строкам,\n"
+                "читается по столбцам.\n"
+                "Глубина 8 → пакет до 8 бит рассыпается\n"
+                "в одиночные ошибки после деперемежения."
+            ),
+            foreground=ACCENT_YELLOW,
+            justify=tk.LEFT,
+            font=("Segoe UI", 8),
+        ).grid(row=2, column=0, columnspan=3, sticky=tk.W, pady=(6, 0))
+
+        # ── Восстановление текста ────────────────────────────────────────────
+        tr_f = ttk.LabelFrame(parent, text="🔧 Восстановление текста (UTF-8 repair)", padding=10)
+        tr_f.pack(fill=tk.X, padx=10, pady=(0, 8))
+
+        ttk.Checkbutton(
+            tr_f, text="✓ Включить восстановление",
+            variable=self.tr_enabled_var,
+        ).grid(row=0, column=0, columnspan=3, sticky=tk.W, pady=(0, 8))
+
+        ttk.Label(tr_f, text="Окно поиска (байт):").grid(row=1, column=0, sticky=tk.W, pady=4)
+        ttk.Spinbox(
+            tr_f, from_=1, to=8, textvariable=self.tr_window_var, width=6,
+        ).grid(row=1, column=1, padx=8, sticky=tk.W)
+        ttk.Label(tr_f, text="≥1", foreground=ACCENT_YELLOW,
+                  font=("Segoe UI", 8)).grid(row=1, column=2, sticky=tk.W)
+
+        ttk.Label(
+            tr_f,
+            text=(
+                "Для каждого нечитаемого символа (U+FFFD)\n"
+                "перебирает битовые сдвиги в окне вокруг\n"
+                "повреждённого байта. Выбирает вариант\n"
+                "с наибольшим числом читаемых символов.\n\n"
+                "Эффективно при BER < 5% и кириллице."
+            ),
+            foreground=ACCENT_YELLOW,
+            justify=tk.LEFT,
+            font=("Segoe UI", 8),
+        ).grid(row=2, column=0, columnspan=3, sticky=tk.W, pady=(6, 0))
+
+        # ── Кнопка панели восстановления ────────────────────────────────────
+        ttk.Separator(parent, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=10, pady=8)
+        ttk.Button(
+            parent,
+            text="📋 Открыть панель восстановления текста",
+            command=self._open_recovery_panel,
+        ).pack(padx=10, pady=4, fill=tk.X)
+
+        ttk.Label(
+            parent,
+            text=(
+                "Панель показывает оригинал и восстановленный\n"
+                "текст рядом. Повреждённые символы выделены."
+            ),
+            foreground=ACCENT_YELLOW,
+            justify=tk.LEFT,
+            font=("Segoe UI", 8),
+        ).pack(padx=10, pady=(2, 0), anchor=tk.W)
+
+    def _open_recovery_panel(self) -> None:
+        """
+        Открывает окно сравнения оригинал vs восстановленный текст.
+        Работает с последними результатами text-симуляции.
+        """
+        # Найти последний text-результат с полями text/original_text
+        results = self.current_results
+        if not results:
+            messagebox.showwarning("Внимание", "Сначала запустите симуляцию в режиме «Текст»")
+            return
+
+        # Ищем последний SNR-результат содержащий текст
+        text_result = None
+        for r in reversed(results):
+            if r.get("original_text") and r.get("text"):
+                text_result = r
+                break
+
+        if text_result is None:
+            messagebox.showwarning("Внимание", "Нет текстовых результатов. Запустите в режиме «Текст».")
+            return
+
+        original  = text_result["original_text"]
+        recovered = text_result["text"]
+        tc        = text_result.get("text_comparison", {})
+        rs        = text_result.get("recovery_stats")
+
+        # ── Окно ────────────────────────────────────────────────────────────
+        win = tk.Toplevel(self.root)
+        win.title("Восстановление текста — сравнение")
+        win.geometry("900x620")
+        win.configure(bg=DARK_BG)
+
+        # Заголовок с метриками
+        hdr = ttk.Frame(win)
+        hdr.pack(fill=tk.X, padx=12, pady=(10, 4))
+
+        cer     = tc.get("correct_percentage", 0)
+        snr_val = text_result.get("snr", "?")
+        ber_val = text_result.get("ber", 0)
+
+        ttk.Label(
+            hdr,
+            text=f"Eb/N0 = {snr_val:.1f} дБ  |  BER = {ber_val:.2e}  |  "
+                 f"CER = {cer:.1f}%  |  "
+                 f"Символов: {tc.get('compared_chars', 0)} сравнено, "
+                 f"{tc.get('correct_chars', 0)} верных",
+            foreground=ACCENT_CYAN,
+            font=("Segoe UI", 10, "bold"),
+        ).pack(anchor=tk.W)
+
+        if rs:
+            ttk.Label(
+                hdr,
+                text=(
+                    f"Восстановление:  OK={rs['chars_ok']}  "
+                    f"Исправлено={rs['chars_fixed']}  "
+                    f"Потеряно={rs['chars_lost']}  "
+                    f"Рейтинг={rs['recovery_rate']:.1%}  "
+                    f"Время={rs['repair_ms']:.1f} мс"
+                ),
+                foreground=ACCENT_GREEN,
+                font=("Segoe UI", 9),
+            ).pack(anchor=tk.W, pady=(2, 0))
+
+        ttk.Separator(win, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=12, pady=6)
+
+        # Два текстовых поля
+        panes = ttk.Frame(win)
+        panes.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 8))
+        panes.columnconfigure(0, weight=1)
+        panes.columnconfigure(1, weight=1)
+
+        for col, (title, content, color) in enumerate([
+            ("📄 ОРИГИНАЛ",      original,  ACCENT_CYAN),
+            ("🔧 ВОССТАНОВЛЕННЫЙ", recovered, ACCENT_GREEN),
+        ]):
+            lbl_f = ttk.Frame(panes)
+            lbl_f.grid(row=0, column=col, sticky="nsew", padx=(0 if col else 0, 6 if col == 0 else 0))
+            panes.rowconfigure(0, weight=1)
+
+            ttk.Label(lbl_f, text=title, foreground=color,
+                      font=("Segoe UI", 10, "bold")).pack(anchor=tk.W, pady=(0, 4))
+
+            txt_widget = scrolledtext.ScrolledText(
+                lbl_f,
+                bg="#0d1b2a", fg=TEXT_COLOR,
+                font=("Consolas", 9),
+                wrap=tk.WORD,
+                height=24,
+            )
+            txt_widget.pack(fill=tk.BOTH, expand=True)
+            txt_widget.insert(tk.END, content)
+
+            # Подсветка повреждённых символов (только для восстановленного)
+            if col == 1:
+                txt_widget.tag_configure("damaged", foreground=ACCENT_PINK,
+                                          background="#2a0010")
+                txt_widget.tag_configure("fixed",   foreground=ACCENT_YELLOW,
+                                          background="#1a1a00")
+                self._highlight_damaged(txt_widget, original, recovered)
+
+            txt_widget.config(state=tk.DISABLED)
+
+        # Легенда
+        leg_f = ttk.Frame(win)
+        leg_f.pack(fill=tk.X, padx=12, pady=(0, 8))
+        for color, bg, text in [
+            (ACCENT_PINK,   "#2a0010", "■ Повреждён (не совпадает с оригиналом)"),
+            (ACCENT_YELLOW, "#1a1a00", "■ Восстановлен (был U+FFFD, теперь читаем)"),
+            (TEXT_COLOR,    DARK_BG,   "■ Верный символ"),
+        ]:
+            tk.Label(leg_f, text=text, bg=bg, fg=color,
+                     font=("Segoe UI", 8), padx=6).pack(side=tk.LEFT, padx=4)
+
+    @staticmethod
+    def _highlight_damaged(
+        widget: scrolledtext.ScrolledText,
+        original: str,
+        recovered: str,
+    ) -> None:
+        """
+        Подсвечивает в виджете символы восстановленного текста:
+          - розовый (#damaged): символ отличается от оригинала
+          - жёлтый  (#fixed):   символ был «?» но стал читаемым
+        """
+        n = min(len(original), len(recovered))
+        for i in range(n):
+            o_ch = original[i]
+            r_ch = recovered[i]
+            if r_ch == "?":
+                tag = "damaged"
+            elif o_ch != r_ch:
+                tag = "damaged"
+            else:
+                continue
+            # Позиция в Text: строка 1, символ i
+            # scrolledtext считает с "1.0"
+            try:
+                idx_start = f"1.0 + {i} chars"
+                idx_end   = f"1.0 + {i + 1} chars"
+                widget.tag_add(tag, idx_start, idx_end)
+            except Exception:
+                pass
+
     def _build_plot_tab(self, parent: ttk.Frame) -> None:
         ttk.Checkbutton(parent, text="✓ Теоретические кривые AWGN",
                         variable=self.show_theo_var).pack(anchor=tk.W, padx=15, pady=10)
@@ -600,15 +933,16 @@ class SimulationGUI:
                   justify=tk.LEFT, foreground=ACCENT_YELLOW).pack(anchor=tk.W, padx=15, pady=10)
 
     def _build_metrics_table(self, parent: ttk.Frame) -> None:
-        cols = ("snr", "ber", "ser", "theo_ber", "theo_ser", "cer")
+        cols = ("snr", "ber", "ber_post", "ser", "theo_ber", "epf", "cer")
         self.tree = ttk.Treeview(parent, columns=cols, show="headings", height=5)
         for col, heading, width in [
-            ("snr",      "Eb/N0\n(дБ)",  80),
-            ("ber",      "BER\n(эксп.)", 100),
-            ("ser",      "SER\n(эксп.)", 100),
-            ("theo_ber", "BER\n(теор.)", 110),
-            ("theo_ser", "SER\n(теор.)", 110),
-            ("cer",      "CER\n(%)",      90),
+            ("snr",      "Eb/N0\n(дБ)",    80),
+            ("ber",      "BER\n(пост-дш)", 100),
+            ("ber_post", "BER\n(пре-дш)",  100),
+            ("ser",      "SER\n(эксп.)",   100),
+            ("theo_ber", "BER\n(теор.)",   110),
+            ("epf",      "Распр.\nошибок",  90),
+            ("cer",      "CER\n(%)",         90),
         ]:
             self.tree.heading(col, text=heading)
             self.tree.column(col, width=width, anchor=tk.CENTER)
@@ -764,8 +1098,22 @@ class SimulationGUI:
                 "enabled":     self.per_enabled_var.get(),
                 "packet_size": per_packet,
             },
+            "encryption": {
+                "enabled":  self.enc_enabled_var.get(),
+                "type":     self.enc_type_var.get(),
+                "aes_mode": self.enc_aes_mode_var.get(),
+                "key_hex":  self.enc_key_var.get().strip() or None,
+            },
             "show_theo":          self.show_theo_var.get(),
             "show_rayleigh_theo": self.show_rayleigh_theo_var.get(),
+            "interleaving": {
+                "enabled": self.il_enabled_var.get(),
+                "depth":   int(self.il_depth_var.get()),
+            },
+            "text_recovery": {
+                "enabled":      self.tr_enabled_var.get(),
+                "window_bytes": int(self.tr_window_var.get()),
+            },
         }
 
     # ── Управление симуляцией ─────────────────────────────────────────────────
@@ -917,12 +1265,16 @@ class SimulationGUI:
                 elif msg[0] == "add_row":
                     s = msg[1]
                     cer = f"{s.get('cer', 0):.2f}" if s.get("cer", 0) else "—"
+                    epf = s.get("error_propagation_factor", 1.0)
+                    epf_str = f"{epf:.2f}" if s.get("encryption_enabled") else "—"
+                    ber_post = s.get("ber_post_decrypt", s.get("ber", 0))
                     self.tree.insert("", tk.END, values=(
                         f"{s['snr']:.1f}",
                         f"{s['ber']:.2e}",
+                        f"{ber_post:.2e}",
                         f"{s['ser']:.2e}",
                         f"{s.get('theoretical_ber', 0):.2e}",
-                        f"{s.get('theoretical_ser', 0):.2e}",
+                        epf_str,
                         cer,
                     ))
                     self.tree.see(self.tree.get_children()[-1])
@@ -1186,6 +1538,153 @@ class SimulationGUI:
             messagebox.showinfo("✓ Экспортировано", f"Файл: {filename}")
         except Exception as e:
             messagebox.showerror("✗ Ошибка", f"Ошибка экспорта: {e}")
+
+    def export_csv(self) -> None:
+        """
+        Экспорт текущего прогона в CSV с метаданными.
+        Использует results_manager.export_to_csv() для полного формата по ТЗ.
+        Если текущий прогон не сохранён — предлагает сохранить сначала.
+        """
+        if self.current_results is None:
+            messagebox.showwarning("Внимание", "Нет результатов для экспорта")
+            return
+
+        # Пробуем найти последний сохранённый результат
+        records = results_manager.get_results_list()
+        current_id: str | None = None
+        if records:
+            # Берём самый свежий — пользователь только что мог сохранить
+            current_id = records[0]["id"]
+
+        filename = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV файлы", "*.csv")],
+            title="Экспорт в CSV",
+        )
+        if not filename:
+            return
+
+        try:
+            if current_id:
+                # Полный экспорт через results_manager (с метаданными в заголовке)
+                results_manager.export_to_csv(current_id, filename)
+            else:
+                # Резервный вариант: текущие результаты без метаданных
+                flat = [_flatten_result(r) for r in self.current_results]
+                with open(filename, "w", newline="", encoding="utf-8") as f:
+                    writer = csv.DictWriter(f, fieldnames=flat[0].keys())
+                    writer.writeheader()
+                    writer.writerows(flat)
+
+            messagebox.showinfo("✓ CSV экспортирован", f"Файл: {filename}")
+        except Exception as e:
+            messagebox.showerror("✗ Ошибка", f"Ошибка экспорта CSV: {e}")
+
+    def compare_runs(self) -> None:
+        """
+        Открывает диалог выбора прогонов для сравнения на одном BER-графике.
+        Пользователь выбирает любые 2+ прогона из истории.
+        """
+        records = results_manager.get_results_list()
+        if len(records) < 2:
+            messagebox.showwarning(
+                "Недостаточно данных",
+                "Для сравнения нужно минимум 2 сохранённых прогона.\n"
+                "Сначала сохраните результаты через кнопку «Сохранить»."
+            )
+            return
+
+        # ── Диалог выбора ────────────────────────────────────────────────────
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Сравнить прогоны")
+        dlg.geometry("520x420")
+        dlg.configure(bg=DARK_BG)
+        dlg.resizable(False, True)
+        dlg.grab_set()  # модальный
+
+        tk.Label(dlg, text="Выберите прогоны для сравнения (минимум 2, максимум 5):",
+                 bg=DARK_BG, fg=TEXT_COLOR, font=("Segoe UI", 10)).pack(
+            padx=15, pady=(15, 5), anchor=tk.W)
+
+        # Список с чекбоксами
+        list_frame = tk.Frame(dlg, bg=DARK_BG)
+        list_frame.pack(fill=tk.BOTH, expand=True, padx=15, pady=5)
+
+        canvas = tk.Canvas(list_frame, bg=DARK_BG, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=canvas.yview)
+        inner = tk.Frame(canvas, bg=DARK_BG)
+
+        inner.bind("<Configure>",
+                   lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=inner, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        check_vars: list[tk.BooleanVar] = []
+        for rec in records:
+            var = tk.BooleanVar()
+            check_vars.append(var)
+            mod  = rec.get("modulation", "?")
+            cod  = rec.get("coding_type", "нет")
+            name = rec.get("name", rec["id"])
+            label_text = f"{name}  [{mod} | {cod}]"
+            tk.Checkbutton(
+                inner, text=label_text, variable=var,
+                bg=DARK_BG, fg=TEXT_COLOR, selectcolor=PANEL_BG,
+                activebackground=DARK_BG, activeforeground=ACCENT_CYAN,
+                font=("Segoe UI", 9), anchor=tk.W,
+            ).pack(fill=tk.X, pady=1)
+
+        # Счётчик выбранных
+        count_var = tk.StringVar(value="Выбрано: 0")
+        tk.Label(dlg, textvariable=count_var, bg=DARK_BG,
+                 fg=ACCENT_YELLOW, font=("Segoe UI", 9)).pack(pady=(0, 5))
+
+        def _update_count(*_):
+            n = sum(v.get() for v in check_vars)
+            count_var.set(f"Выбрано: {n}")
+            compare_btn.config(state=tk.NORMAL if 2 <= n <= 5 else tk.DISABLED)
+
+        for v in check_vars:
+            v.trace_add("write", _update_count)
+
+        # ── Кнопки ───────────────────────────────────────────────────────────
+        btn_frame = tk.Frame(dlg, bg=DARK_BG)
+        btn_frame.pack(pady=10)
+
+        def _do_compare():
+            selected_idx = [i for i, v in enumerate(check_vars) if v.get()]
+            if not (2 <= len(selected_idx) <= 5):
+                return
+            dlg.destroy()
+
+            try:
+                results_data: list[list[dict]] = []
+                labels: list[str] = []
+                for idx in selected_idx:
+                    rec = records[idx]
+                    _, pts = results_manager.load_results(rec["id"])
+                    results_data.append(pts)
+                    mod  = rec.get("modulation", "?")
+                    cod  = rec.get("coding_type", "нет")
+                    labels.append(f"{mod} | {cod} | {rec.get('name', rec['id'])}")
+
+                fname, fig = plot_comparison(
+                    results_data, labels, output_dir="simulation_results"
+                )
+                if fig is not None:
+                    self._current_fig = fig
+                    self.display_plot(fig)
+                if fname:
+                    messagebox.showinfo("✓ График сохранён", f"Файл: {fname}")
+            except Exception as e:
+                messagebox.showerror("✗ Ошибка", f"Ошибка сравнения: {e}")
+
+        compare_btn = ttk.Button(btn_frame, text="📈 Сравнить",
+                                  command=_do_compare, state=tk.DISABLED)
+        compare_btn.pack(side=tk.LEFT, padx=8)
+        ttk.Button(btn_frame, text="Отмена", command=dlg.destroy).pack(side=tk.LEFT, padx=8)
 
     def show_log(self) -> None:
         log_dir = "logs"

@@ -13,6 +13,11 @@ _log_config():
   • Shadowing и Multipath добавлены.
   • Логирование PER packet_size.
 
+_run_pipeline() [новое]:
+  • Единый внутренний пайплайн: кодирование → модуляция → канал → декодирование → метрики.
+  • Возвращает 'decoded_bits' (np.ndarray) для использования в text-режиме.
+  • simulate_transmission / simulate_text_transmission — тонкие обёртки над ним.
+
 simulate_transmission() / simulate_text_transmission():
   • Адаптивное число бит:
       prev_ber < 1e-5  → ×100   (до max_adaptive_bits = 10 млн)
@@ -42,6 +47,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+from encryption import get_cipher, compute_encryption_stats, aes_available
 from modulation import (
     PSKModulator, QAMModulator,
     theoretical_ber_psk, theoretical_ser_psk,
@@ -51,6 +57,8 @@ from modulation import (
 from coding import HammingCoder, LDPCCoder, TurboCoder, compute_coding_gain
 from results_manager import ResultsManager
 from channel import CompositeChannelModel
+from interleaving import get_interleaver
+from text_recovery import recover_text, RecoveryResult
 
 results_manager = ResultsManager()
 logger = logging.getLogger(__name__)
@@ -324,6 +332,203 @@ def _log_config(config: dict, mode: str,
 # Основные функции симуляции
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _run_pipeline(
+    config:    dict,
+    data_bits: np.ndarray,
+    ebn0_dB:   float,
+    prev_ber:  float | None = None,
+    log_prefix: str = "",
+) -> dict:
+    """
+    Единый внутренний пайплайн симуляции одной SNR-точки.
+
+    Принимает уже подготовленные информационные биты (до кодирования).
+    Адаптивное масштабирование num_bits и логирование конфига —
+    ответственность вызывающей функции.
+
+    Args:
+        config     : конфигурация симуляции
+        data_bits  : информационные биты (uint8 ndarray)
+        ebn0_dB    : Eb/N0 в дБ
+        prev_ber   : BER предыдущей точки (используется только для adaptive_scale)
+        log_prefix : префикс строки лога ("" для random, "TEXT " для text)
+
+    Returns:
+        dict со всеми метриками, включая 'decoded_bits' (np.ndarray).
+        Поле 'adaptive_scale' равно 1 если prev_ber не передан.
+        Поля 'text', 'original_text', 'text_comparison' НЕ включены —
+        их добавляет simulate_text_transmission().
+    """
+    mod              = create_modulator(config)
+    coder, code_rate = create_coder(config)
+    channel          = CompositeChannelModel(config.get("channel", {}))
+
+    # ── Шифрование (до кодирования) ──────────────────────────────────────────
+    enc_cfg  = config.get("encryption", {})
+    enc_enabled = enc_cfg.get("enabled", False)
+    cipher = None
+    if enc_enabled:
+        cipher = get_cipher(
+            cipher_type=enc_cfg.get("type", "none"),
+            mode=enc_cfg.get("aes_mode", "CBC"),
+            key_hex=enc_cfg.get("key_hex") or None,
+        )
+
+    t_enc_cipher = time.perf_counter()
+    if cipher is not None:
+        encrypted_bits = cipher.encrypt(data_bits)
+    else:
+        encrypted_bits = data_bits
+    encrypt_cipher_ms = (time.perf_counter() - t_enc_cipher) * 1e3
+
+    # ── Кодирование ──────────────────────────────────────────────────────────
+    t_enc = time.perf_counter()
+    tx_bits = coder.encode(encrypted_bits) if coder is not None else encrypted_bits.copy()
+    encode_time_ms = (time.perf_counter() - t_enc) * 1e3
+
+    # ── Модуляция + канал ────────────────────────────────────────────────────
+    tx_symbols = mod.modulate(tx_bits)
+    bps        = mod.bits_per_symbol
+    ebn0_lin   = 10.0 ** (ebn0_dB / 10.0)
+    snr_lin    = ebn0_lin * code_rate * bps
+    rx_symbols, channel_coeff = channel.apply_with_coeff(tx_symbols, snr_lin)
+    rx_bits = mod.demodulate(rx_symbols, channel_coeff)
+
+    # ── Декодирование ────────────────────────────────────────────────────────
+    t_dec = time.perf_counter()
+    if coder is not None:
+        decoded_bits, coding_stats = coder.decode(rx_bits)
+    else:
+        decoded_bits = rx_bits
+        coding_stats = _empty_coding_stats()
+    decode_time_ms = (time.perf_counter() - t_dec) * 1e3
+    coding_stats["encode_time_ms"] = encode_time_ms
+    coding_stats["decode_time_ms"] = decode_time_ms
+
+    # ── Дешифровка (после декодирования) ─────────────────────────────────────
+    # decoded_bits содержит зашифрованный поток (с ошибками канала после FEC).
+    # Обрезаем до длины encrypted_bits перед дешифровкой.
+    decoded_bits_raw = decoded_bits[:len(encrypted_bits)]
+
+    t_dec_cipher = time.perf_counter()
+    if cipher is not None:
+        decrypted_bits = cipher.decrypt(decoded_bits_raw)
+        # Выравниваем по длине оригинальных данных
+        decrypted_bits = decrypted_bits[:len(data_bits)]
+        if len(decrypted_bits) < len(data_bits):
+            decrypted_bits = np.concatenate([
+                decrypted_bits,
+                np.zeros(len(data_bits) - len(decrypted_bits), dtype=np.uint8)
+            ])
+    else:
+        decrypted_bits = decoded_bits_raw[:len(data_bits)]
+    decrypt_cipher_ms = (time.perf_counter() - t_dec_cipher) * 1e3
+
+    # ── BER: два уровня ───────────────────────────────────────────────────────
+    # 1. BER после декодера (до дешифровки) — показывает влияние канала + FEC
+    #    Сравниваем decoded_bits_raw с encrypted_bits (что было подано в кодер)
+    min_enc = min(len(encrypted_bits), len(decoded_bits_raw))
+    bit_errors_pre = int(np.sum(
+        encrypted_bits[:min_enc] != decoded_bits_raw[:min_enc]
+    ))
+    ber_pre_decrypt = bit_errors_pre / min_enc if min_enc > 0 else 0.0
+
+    # 2. BER после дешифровки — итоговый, сравниваем с оригинальными данными
+    min_len    = min(len(data_bits), len(decrypted_bits))
+    bit_errors = int(np.sum(data_bits[:min_len] != decrypted_bits[:min_len]))
+    ber = bit_errors / min_len if min_len > 0 else 0.0
+
+    ser = _compute_ser(mod, tx_bits, rx_bits, ber_pre_decrypt)
+
+    # ── PER ──────────────────────────────────────────────────────────────────
+    per_cfg     = config.get("per_settings", {})
+    packet_size = per_cfg.get("packet_size", 1024) if per_cfg.get("enabled", False) else 0
+    per, per_err, per_total = _compute_per(
+        data_bits[:min_len], decrypted_bits[:min_len], packet_size
+    )
+
+    # ── Теоретические кривые ─────────────────────────────────────────────────
+    theo_ber_val     = theoretical_ber(config, ebn0_dB)
+    theo_ser_val     = theoretical_ser(config, ebn0_dB)
+    rayleigh_ber_val = theoretical_ber_rayleigh(config, ebn0_dB)
+
+    # ── Ранняя остановка ─────────────────────────────────────────────────────
+    early_stop_ber = config.get("early_stop_ber", 1e-7)
+    early_stop = bool(ber < early_stop_ber and early_stop_ber > 0)
+
+    esn0_dB       = 10.0 * np.log10(snr_lin) if snr_lin > 0 else float("-inf")
+    channel_names = channel.get_channel_names()
+
+    # Для отображения в логе adaptive_scale считаем по base_bits если доступен
+    base_bits = config.get("random_settings", {}).get("num_bits", min_len)
+    adaptive_scale = (
+        _adaptive_num_bits(
+            base_bits, prev_ber,
+            max_bits=config.get("random_settings", {}).get("max_adaptive_bits", 10_000_000),
+        ) // base_bits
+        if base_bits > 0 else 1
+    )
+
+    logger.info(
+        f"{log_prefix}Eb/N0={ebn0_dB:.2f} dB | Es/N0={esn0_dB:.2f} dB | "
+        f"Mod={mod.__class__.__name__}-{mod.M} | Gray={mod.use_gray_code} | "
+        f"CodeRate={code_rate:.3f} | Bits={min_len} | BitErrors={bit_errors} | "
+        f"BER={ber:.3e} | BER_pre={ber_pre_decrypt:.3e} | SER={ser:.3e} | PER={per:.3e} | "
+        f"Cipher={cipher.name if cipher else 'none'} | "
+        f"EncodeMs={encode_time_ms:.1f} | DecodeMs={decode_time_ms:.1f} | "
+        f"EncryptMs={encrypt_cipher_ms:.1f} | DecryptMs={decrypt_cipher_ms:.1f} | "
+        f"Corrected={coding_stats.get('corrected_errors', 0)} | "
+        f"Detected={coding_stats.get('detected_errors', 0)} | "
+        f"Blocks={coding_stats.get('total_blocks', 0)} | "
+        f"Channels={channel_names}"
+    )
+
+    # Статистика ошибок с учётом шифрования
+    enc_stats = compute_encryption_stats(
+        data_bits, decrypted_bits, decoded_bits_raw, cipher
+    )
+    # Коррекция error_propagation_factor: используем ber_pre_decrypt как знаменатель
+    if ber_pre_decrypt > 1e-12:
+        enc_stats["error_propagation_factor"] = ber / ber_pre_decrypt
+    else:
+        enc_stats["error_propagation_factor"] = 1.0
+
+    return {
+        "snr":                      ebn0_dB,
+        "ber":                      float(ber),
+        "ber_pre_decrypt":          float(ber_pre_decrypt),
+        "ser":                      float(ser),
+        "per":                      float(per),
+        "per_packet_errors":        per_err,
+        "per_total_packets":        per_total,
+        "theoretical_ber":          float(theo_ber_val),
+        "theoretical_ser":          float(theo_ser_val),
+        "rayleigh_theoretical_ber": float(rayleigh_ber_val),
+        "Es":                       1.0,
+        "Eb":                       1.0 / (bps * code_rate),
+        "spectral_efficiency":      float(bps * code_rate),
+        "corrected_errors":         coding_stats.get("corrected_errors", 0),
+        "detected_errors":          coding_stats.get("detected_errors", 0),
+        "total_blocks":             coding_stats.get("total_blocks", 0),
+        "encode_time_ms":           encode_time_ms,
+        "decode_time_ms":           decode_time_ms,
+        "active_channels":          channel_names,
+        "num_bits_used":            min_len,
+        "early_stop":               early_stop,
+        "adaptive_scale":           adaptive_scale,
+        # Шифрование
+        "encryption_enabled":       enc_enabled,
+        "cipher_name":              cipher.name if cipher else "none",
+        "encrypt_time_ms":          encrypt_cipher_ms,
+        "decrypt_time_ms":          decrypt_cipher_ms,
+        "ber_post_decrypt":         enc_stats["ber_post_decrypt"],
+        "aes_block_errors":         enc_stats["aes_block_errors"],
+        "error_propagation_factor": enc_stats["error_propagation_factor"],
+        # decoded_bits для text-режима (дешифрованные)
+        "decoded_bits":             decrypted_bits,
+    }
+
+
 def simulate_transmission(config: dict,
                            ebn0_dB: float,
                            data_bits: np.ndarray | None = None,
@@ -343,15 +548,10 @@ def simulate_transmission(config: dict,
         dict: snr, ber, ser, per, theoretical_ber, theoretical_ser,
               rayleigh_theoretical_ber, coding_gain_dB, early_stop, и т.д.
     """
-    mod     = create_modulator(config)
-    coder, code_rate = create_coder(config)
-    channel = CompositeChannelModel(config.get("channel", {}))
-
-    # Адаптивное число бит
     base_bits = config["random_settings"]["num_bits"]
     num_bits  = _adaptive_num_bits(
         base_bits, prev_ber,
-        max_bits=config["random_settings"].get("max_adaptive_bits", 10_000_000)
+        max_bits=config["random_settings"].get("max_adaptive_bits", 10_000_000),
     )
 
     if data_bits is None:
@@ -360,90 +560,7 @@ def simulate_transmission(config: dict,
     if log_config_once:
         _log_config(config, "random", data_bits_len=len(data_bits))
 
-    # ── Кодирование ──────────────────────────────────────────────────────────
-    t_enc  = time.perf_counter()
-    tx_bits = coder.encode(data_bits) if coder is not None else data_bits.copy()
-    encode_time_ms = (time.perf_counter() - t_enc) * 1e3
-
-    # ── Модуляция + канал ────────────────────────────────────────────────────
-    tx_symbols = mod.modulate(tx_bits)
-    bps        = mod.bits_per_symbol
-    ebn0_lin   = 10.0 ** (ebn0_dB / 10.0)
-    snr_lin    = ebn0_lin * code_rate * bps
-    rx_symbols, channel_coeff = channel.apply_with_coeff(tx_symbols, snr_lin)
-    rx_bits = mod.demodulate(rx_symbols, channel_coeff)
-
-    # ── Декодирование ────────────────────────────────────────────────────────
-    t_dec = time.perf_counter()
-    if coder is not None:
-        decoded_bits, coding_stats = coder.decode(rx_bits)
-    else:
-        decoded_bits = rx_bits
-        coding_stats = _empty_coding_stats()
-    decode_time_ms = (time.perf_counter() - t_dec) * 1e3
-    coding_stats["encode_time_ms"] = encode_time_ms
-    coding_stats["decode_time_ms"] = decode_time_ms
-
-    decoded_bits = decoded_bits[:len(data_bits)]
-    min_len      = min(len(data_bits), len(decoded_bits))
-    bit_errors   = int(np.sum(data_bits[:min_len] != decoded_bits[:min_len]))
-    ber = bit_errors / min_len if min_len > 0 else 0.0
-    ser = _compute_ser(mod, tx_bits, rx_bits, ber)
-
-    # ── PER ──────────────────────────────────────────────────────────────────
-    per_cfg     = config.get("per_settings", {})
-    packet_size = per_cfg.get("packet_size", 1024) if per_cfg.get("enabled", False) else 0
-    per, per_err, per_total = _compute_per(
-        data_bits[:min_len], decoded_bits[:min_len], packet_size
-    )
-
-    # ── Теоретические кривые ─────────────────────────────────────────────────
-    theo_ber_val     = theoretical_ber(config, ebn0_dB)
-    theo_ser_val     = theoretical_ser(config, ebn0_dB)
-    rayleigh_ber_val = theoretical_ber_rayleigh(config, ebn0_dB)
-
-    # ── Ранняя остановка ─────────────────────────────────────────────────────
-    early_stop_ber = config.get("early_stop_ber", 1e-7)
-    early_stop = bool(ber < early_stop_ber and early_stop_ber > 0)
-
-    esn0_dB       = 10.0 * np.log10(snr_lin) if snr_lin > 0 else float("-inf")
-    channel_names = channel.get_channel_names()
-
-    logger.info(
-        f"Eb/N0={ebn0_dB:.2f} dB | Es/N0={esn0_dB:.2f} dB | "
-        f"Mod={mod.__class__.__name__}-{mod.M} | Gray={mod.use_gray_code} | "
-        f"CodeRate={code_rate:.3f} | Bits={min_len} | BitErrors={bit_errors} | "
-        f"BER={ber:.3e} | SER={ser:.3e} | PER={per:.3e} | "
-        f"EncodeMs={encode_time_ms:.1f} | DecodeMs={decode_time_ms:.1f} | "
-        f"Corrected={coding_stats.get('corrected_errors', 0)} | "
-        f"Detected={coding_stats.get('detected_errors', 0)} | "
-        f"Blocks={coding_stats.get('total_blocks', 0)} | "
-        f"Channels={channel_names}"
-    )
-
-    return {
-        "snr":                      ebn0_dB,
-        "ber":                      float(ber),
-        "ser":                      float(ser),
-        "per":                      float(per),
-        "per_packet_errors":        per_err,
-        "per_total_packets":        per_total,
-        "theoretical_ber":          float(theo_ber_val),
-        "theoretical_ser":          float(theo_ser_val),
-        "rayleigh_theoretical_ber": float(rayleigh_ber_val),
-        "Es":                       1.0,
-        "Eb":                       1.0 / (bps * code_rate),
-        "spectral_efficiency":      float(bps * code_rate),
-        "corrected_errors":         coding_stats.get("corrected_errors", 0),
-        "detected_errors":          coding_stats.get("detected_errors", 0),
-        "total_blocks":             coding_stats.get("total_blocks", 0),
-        "encode_time_ms":           encode_time_ms,
-        "decode_time_ms":           decode_time_ms,
-        "active_channels":          channel_names,
-        "num_bits_used":            min_len,
-        "early_stop":               early_stop,
-        "adaptive_scale":           num_bits // base_bits if base_bits > 0 else 1,
-    }
+    return _run_pipeline(config, data_bits, ebn0_dB, prev_ber=prev_ber)
 
 
 def simulate_text_transmission(config: dict,
@@ -457,10 +574,6 @@ def simulate_text_transmission(config: dict,
     Вычисляет PER если включено в config["per_settings"].
     Возвращает rayleigh_theoretical_ber.
     """
-    mod     = create_modulator(config)
-    coder, code_rate = create_coder(config)
-    channel = CompositeChannelModel(config.get("channel", {}))
-
     if log_config_once:
         _log_config(config, "text", text_len=len(text))
 
@@ -469,80 +582,45 @@ def simulate_text_transmission(config: dict,
     if len(original_bits) > max_bits:
         original_bits = original_bits[:max_bits]
 
-    # ── Кодирование ──────────────────────────────────────────────────────────
-    t_enc  = time.perf_counter()
-    tx_bits = coder.encode(original_bits) if coder is not None else original_bits.copy()
-    encode_time_ms = (time.perf_counter() - t_enc) * 1e3
+    result = _run_pipeline(config, original_bits, ebn0_dB, log_prefix="TEXT ")
 
-    # ── Модуляция + канал ────────────────────────────────────────────────────
-    tx_symbols = mod.modulate(tx_bits)
-    bps        = mod.bits_per_symbol
-    ebn0_lin   = 10.0 ** (ebn0_dB / 10.0)
-    snr_lin    = ebn0_lin * code_rate * bps
-    rx_symbols, channel_coeff = channel.apply_with_coeff(tx_symbols, snr_lin)
-    rx_bits = mod.demodulate(rx_symbols, channel_coeff)
+    # ── Text-специфичные поля ────────────────────────────────────────────────
+    encoding = config["text_settings"]["text_encoding"]
 
-    # ── Декодирование ────────────────────────────────────────────────────────
-    t_dec = time.perf_counter()
-    if coder is not None:
-        decoded_bits, coding_stats = coder.decode(rx_bits)
+    # Восстановление текста: TextRecovery если включён, иначе стандартный путь
+    tr_cfg = config.get("text_recovery", {})
+    if tr_cfg.get("enabled", False):
+        rec = recover_text(
+            result["decoded_bits"],
+            original_len=len(text),
+            encoding=encoding,
+            window_bytes=tr_cfg.get("window_bytes", 3),
+        )
+        decoded_text = rec.text
+        result["recovery_stats"] = {
+            "chars_ok":      rec.chars_ok,
+            "chars_fixed":   rec.chars_fixed,
+            "chars_lost":    rec.chars_lost,
+            "total_chars":   rec.total_chars,
+            "recovery_rate": rec.recovery_rate,
+            "repair_ms":     rec.repair_time_ms,
+        }
     else:
-        decoded_bits = rx_bits
-        coding_stats = _empty_coding_stats()
-    decode_time_ms = (time.perf_counter() - t_dec) * 1e3
-    coding_stats["encode_time_ms"] = encode_time_ms
-    coding_stats["decode_time_ms"] = decode_time_ms
-
-    decoded_bits = decoded_bits[:len(original_bits)]
-    decoded_text = bits_to_text(decoded_bits, config["text_settings"]["text_encoding"])
-
-    min_len    = min(len(original_bits), len(decoded_bits))
-    bit_errors = int(np.sum(original_bits[:min_len] != decoded_bits[:min_len]))
-    ber = bit_errors / min_len if min_len > 0 else 0.0
-    ser = _compute_ser(mod, tx_bits, rx_bits, ber)
-
-    # ── PER ──────────────────────────────────────────────────────────────────
-    per_cfg     = config.get("per_settings", {})
-    packet_size = per_cfg.get("packet_size", 1024) if per_cfg.get("enabled", False) else 0
-    per, per_err, per_total = _compute_per(
-        original_bits[:min_len], decoded_bits[:min_len], packet_size
-    )
-
-    # ── Теоретические кривые ─────────────────────────────────────────────────
-    theo_ber_val     = theoretical_ber(config, ebn0_dB)
-    theo_ser_val     = theoretical_ser(config, ebn0_dB)
-    rayleigh_ber_val = theoretical_ber_rayleigh(config, ebn0_dB)
+        decoded_text = bits_to_text(result["decoded_bits"], encoding)
+        result["recovery_stats"] = None
 
     text_comparison = compare_texts(text, decoded_text)
-    channel_names   = channel.get_channel_names()
-    esn0_dB         = 10.0 * np.log10(snr_lin) if snr_lin > 0 else float("-inf")
 
+    # Логируем CER отдельно (не дублируем весь лог из _run_pipeline)
     logger.info(
-        f"TEXT Eb/N0={ebn0_dB:.2f} dB | Es/N0={esn0_dB:.2f} dB | "
-        f"Mod={mod.__class__.__name__}-{mod.M} | CodeRate={code_rate:.3f} | "
-        f"Bits={min_len} | BitErrors={bit_errors} | BER={ber:.3e} | SER={ser:.3e} | "
-        f"PER={per:.3e} | CER={text_comparison['correct_percentage']:.2f}% | "
-        f"EncodeMs={encode_time_ms:.1f} | DecodeMs={decode_time_ms:.1f} | "
-        f"Channels={channel_names}"
+        f"TEXT CER={text_comparison['correct_percentage']:.2f}% | "
+        f"Eb/N0={ebn0_dB:.2f} dB"
     )
 
-    return {
-        "snr":                      ebn0_dB,
-        "text":                     decoded_text,
-        "ber":                      float(ber),
-        "ser":                      float(ser),
-        "per":                      float(per),
-        "per_packet_errors":        per_err,
-        "per_total_packets":        per_total,
-        "theoretical_ber":          float(theo_ber_val),
-        "theoretical_ser":          float(theo_ser_val),
-        "rayleigh_theoretical_ber": float(rayleigh_ber_val),
-        "original_text":            text,
-        "text_comparison":          text_comparison,
-        "active_channels":          channel_names,
-        "encode_time_ms":           encode_time_ms,
-        "decode_time_ms":           decode_time_ms,
-    }
+    result["text"]            = decoded_text
+    result["original_text"]   = text
+    result["text_comparison"] = text_comparison
+    return result
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -791,4 +869,99 @@ def plot_and_save_results(config: dict,
     fig.tight_layout()
     fig.savefig(plot_filename, dpi=150, facecolor=BG)
     logger.info(f"График сохранён: {plot_filename}")
+    return plot_filename, fig
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Сравнение нескольких прогонов на одном графике
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Палитра для сравнения: каждый прогон получает свой цвет
+_COMPARISON_PALETTE = [
+    "#00d9ff",  # cyan
+    "#ff006e",  # pink
+    "#39ff14",  # green
+    "#ffbe0b",  # yellow
+    "#ff7700",  # orange
+]
+
+# Маркеры для различения прогонов при ч/б печати
+_COMPARISON_MARKERS = ["o", "s", "^", "D", "v"]
+
+
+def plot_comparison(
+    results_list:     list,
+    labels:           list,
+    show_theoretical: bool = True,
+    output_dir:       str  = ".",
+) -> tuple:
+    """
+    Строит BER-кривые нескольких прогонов на одном графике.
+
+    Args:
+        results_list     : список прогонов; каждый прогон — список точек (dict),
+                           как возвращает simulate_transmission().
+        labels           : метки для легенды, len == len(results_list).
+        show_theoretical : рисовать теоретический BER (AWGN) для первого прогона.
+        output_dir       : папка для сохранения PNG.
+
+    Returns:
+        (plot_filename, fig) — путь к файлу и объект Figure.
+        Возвращает (None, None) если results_list пуст.
+
+    Примечания:
+        - Каждая кривая строится по своим SNR-точкам независимо.
+          Разные SNR-сетки у прогонов корректно отображаются без интерполяции.
+        - Тот же dark theme что и plot_and_save_results().
+    """
+    if not results_list or not any(results_list):
+        return None, None
+
+    os.makedirs(output_dir, exist_ok=True)
+    timestamp     = datetime.now().strftime("%Y%m%d_%H%M%S")
+    plot_filename = os.path.join(output_dir, f"Compare_{timestamp}.png")
+
+    BG = "#1a1a2e"
+    plt.style.use("dark_background")
+
+    fig, ax = plt.subplots(figsize=(11, 6))
+    fig.patch.set_facecolor(BG)
+
+    for run_idx, (points, label) in enumerate(zip(results_list, labels)):
+        if not points:
+            continue
+
+        color  = _COMPARISON_PALETTE[run_idx % len(_COMPARISON_PALETTE)]
+        marker = _COMPARISON_MARKERS[run_idx % len(_COMPARISON_MARKERS)]
+
+        snr = np.array([r["snr"] for r in points])
+        ber = np.array([r["ber"] for r in points])
+
+        ax.semilogy(
+            snr, np.clip(ber, 1e-9, 1),
+            linestyle="-", marker=marker, color=color,
+            lw=2.5, ms=6, label=label,
+            markerfacecolor=color, markeredgewidth=1.5, markeredgecolor="white",
+        )
+
+        # Теоретический BER (AWGN) — только для первого прогона, пунктир того же цвета
+        if show_theoretical and run_idx == 0:
+            theo = np.array([r.get("theoretical_ber", 0) for r in points])
+            if np.any(theo > 0):
+                ax.semilogy(
+                    snr, np.clip(theo, 1e-9, 1),
+                    linestyle=":", color=color, lw=1.5, alpha=0.7,
+                    label=f"{label} (теория AWGN)",
+                )
+
+    ax.set_ylim(1e-6, 1)
+    ax.grid(True, alpha=0.25, linestyle="--")
+    ax.set_xlabel("Eb/N0 (дБ)", fontsize=11, fontweight="bold")
+    ax.set_ylabel("BER", fontsize=11, fontweight="bold")
+    ax.set_title("Сравнение прогонов — BER", fontsize=13, fontweight="bold", pad=15)
+    ax.legend(fontsize=9, framealpha=0.9)
+
+    fig.tight_layout()
+    fig.savefig(plot_filename, dpi=150, facecolor=BG)
+    logger.info(f"График сравнения сохранён: {plot_filename}")
     return plot_filename, fig

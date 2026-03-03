@@ -367,9 +367,19 @@ class ResultsManager:
         """
         Экспортирует результаты одного прогона в CSV.
 
-        Поля CSV включают: snr, ber, ser, per, theoretical_ber, theoretical_ser,
-        rayleigh_theoretical_ber, encode_time_ms, decode_time_ms,
-        corrected_errors, detected_errors, total_blocks.
+        Формат файла:
+          - Первые строки: метаданные в виде комментариев "# ключ: значение".
+            Excel показывает их как текст; при импорте данных игнорирует.
+          - Далее: заголовок и строки данных, разделитель — запятая,
+            десятичный разделитель — точка (стандарт для Excel с любой локалью
+            при открытии через Данные → Из текста/CSV).
+
+        Поля данных (порядок столбцов):
+            snr_dB, ber, ser, per,
+            theoretical_ber, theoretical_ser, rayleigh_theoretical_ber,
+            encode_time_ms, decode_time_ms,
+            corrected_errors, detected_errors, total_blocks,
+            num_bits_used, early_stop, adaptive_scale, spectral_efficiency
 
         Returns:
             Path к созданному файлу.
@@ -381,33 +391,97 @@ class ResultsManager:
         config, results = self.load_results(result_id)
         out = Path(filename)
 
-        # Нормализуем каждую запись: плоская структура без вложенных dict
+        # ── Метаданные для заголовка ─────────────────────────────────────────
+        mod_cfg     = config.get("modulation", {})
+        coding_cfg  = config.get("coding", {})
+        ebn0_range  = config.get("ebn0_dB_range", [])
+
+        modulation_str = f"{mod_cfg.get('type', '?')}-{mod_cfg.get('order', '?')}"
+        if coding_cfg.get("enabled", False):
+            ct = coding_cfg.get("type", "?")
+            if ct == "turbo":
+                coding_str = "Turbo (R≈1/3)"
+            else:
+                coding_str = (
+                    f"{ct.upper()} "
+                    f"({coding_cfg.get('n', '?')},{coding_cfg.get('k', '?')})"
+                )
+        else:
+            coding_str = "нет"
+
+        active_channels: set[str] = set()
+        for r in results:
+            active_channels.update(r.get("active_channels", []))
+        channels_str = ", ".join(sorted(active_channels)) or "AWGN"
+
+        snr_range_str = (
+            f"{min(ebn0_range):.1f}..{max(ebn0_range):.1f} дБ"
+            if len(ebn0_range) >= 2 else "?"
+        )
+
+        metadata_lines = [
+            f"# Симулятор цифровой связи — экспорт результатов",
+            f"# Дата: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            f"# Модуляция: {modulation_str}",
+            f"# Кодирование: {coding_str}",
+            f"# Каналы: {channels_str}",
+            f"# Диапазон Eb/N0: {snr_range_str}",
+            f"# Точек SNR: {len(results)}",
+        ]
+
+        # ── Нормализация строк данных ────────────────────────────────────────
+        # Порядок столбцов фиксирован — совпадает с ТЗ
+        fieldnames = [
+            "snr_dB",
+            "ber", "ber_pre_decrypt", "ber_post_decrypt",
+            "ser", "per",
+            "theoretical_ber", "theoretical_ser", "rayleigh_theoretical_ber",
+            "encode_time_ms", "decode_time_ms",
+            "encrypt_time_ms", "decrypt_time_ms",
+            "corrected_errors", "detected_errors", "total_blocks",
+            "num_bits_used", "early_stop", "adaptive_scale", "spectral_efficiency",
+            "encryption_enabled", "cipher_name",
+            "aes_block_errors", "error_propagation_factor",
+        ]
+
         flat_results = []
         for r in results:
-            row = {
-                "snr":                      r.get("snr",   0),
-                "ber":                      r.get("ber",   0),
-                "ser":                      r.get("ser",   0),
-                "per":                      r.get("per",   0),
-                "theoretical_ber":          r.get("theoretical_ber",   0),
-                "theoretical_ser":          r.get("theoretical_ser",   0),
+            flat_results.append({
+                "snr_dB":                   r.get("snr",                      0),
+                "ber":                      r.get("ber",                      0),
+                "ber_pre_decrypt":          r.get("ber_pre_decrypt",          r.get("ber", 0)),
+                "ber_post_decrypt":         r.get("ber_post_decrypt",         r.get("ber", 0)),
+                "ser":                      r.get("ser",                      0),
+                "per":                      r.get("per",                      0),
+                "theoretical_ber":          r.get("theoretical_ber",          0),
+                "theoretical_ser":          r.get("theoretical_ser",          0),
                 "rayleigh_theoretical_ber": r.get("rayleigh_theoretical_ber", 0),
-                "encode_time_ms":           r.get("encode_time_ms", 0),
-                "decode_time_ms":           r.get("decode_time_ms", 0),
-                "corrected_errors":         r.get("corrected_errors", 0),
-                "detected_errors":          r.get("detected_errors",  0),
-                "total_blocks":             r.get("total_blocks",      0),
-                "num_bits_used":            r.get("num_bits_used",     0),
-                "spectral_efficiency":      r.get("spectral_efficiency", 0),
-                "adaptive_scale":           r.get("adaptive_scale",   1),
-            }
-            flat_results.append(row)
+                "encode_time_ms":           r.get("encode_time_ms",           0),
+                "decode_time_ms":           r.get("decode_time_ms",           0),
+                "encrypt_time_ms":          r.get("encrypt_time_ms",          0),
+                "decrypt_time_ms":          r.get("decrypt_time_ms",          0),
+                "corrected_errors":         r.get("corrected_errors",         0),
+                "detected_errors":          r.get("detected_errors",          0),
+                "total_blocks":             r.get("total_blocks",             0),
+                "num_bits_used":            r.get("num_bits_used",            0),
+                "early_stop":               int(r.get("early_stop",           False)),
+                "adaptive_scale":           r.get("adaptive_scale",           1),
+                "spectral_efficiency":      r.get("spectral_efficiency",      0),
+                "encryption_enabled":       int(r.get("encryption_enabled",   False)),
+                "cipher_name":              r.get("cipher_name",              "none"),
+                "aes_block_errors":         r.get("aes_block_errors",         0),
+                "error_propagation_factor": r.get("error_propagation_factor", 1.0),
+            })
 
         with open(out, "w", newline="", encoding="utf-8") as f:
-            if flat_results:
-                writer = csv.DictWriter(f, fieldnames=flat_results[0].keys())
-                writer.writeheader()
-                writer.writerows(flat_results)
+            # Метаданные
+            for line in metadata_lines:
+                f.write(line + "\n")
+
+            # Данные
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(flat_results)
 
         logger.info(f"Результаты экспортированы в CSV: {out}")
         return out
