@@ -39,12 +39,18 @@ export_results():
   • Rician-канал добавлен в _build_channel_tab() (был в config, но не в GUI).
   • Mousewheel-scrolling в канал-табе теперь не конфликтует с основным окном:
     используется bind/unbind только внутри виджета (Enter/Leave).
+
+Добавлена поддержка Reed-Solomon (март 2026):
+  • На вкладке кодирования добавлена радиокнопка "Reed-Solomon (байтовый)".
+  • При выборе RS отображается фрейм с параметрами: nsym, nsize, fcr, prim.
+  • В build_config() добавлено считывание этих параметров в секцию coding.
 """
 
 import csv
 import json
 import logging
 import os
+from pathlib import Path
 import queue
 import threading
 import time
@@ -54,6 +60,8 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 import numpy as np
+import os
+print("Текущая рабочая директория:", os.getcwd())
 
 from simulation import (
     simulate_transmission,
@@ -74,6 +82,59 @@ ACCENT_GREEN  = "#39ff14"
 ACCENT_YELLOW = "#ffbe0b"
 TEXT_COLOR    = "#e0e0e0"
 TEXT_LIGHT    = "#ffffff"
+
+
+# ── Вспомогательные функции GUI ───────────────────────────────────────────────
+
+def make_scrollable(tab: "ttk.Frame") -> "ttk.Frame":
+    """
+    Оборачивает содержимое вкладки в прокручиваемый контейнер.
+    Возвращает inner_frame — в него помещается всё содержимое вкладки.
+    Цвет фона совпадает с PANEL_BG (тёмно-синий).
+    """
+    import tkinter as _tk
+    canvas = _tk.Canvas(tab, highlightthickness=0, bg=PANEL_BG)
+    vsb = ttk.Scrollbar(tab, orient="vertical", command=canvas.yview)
+    canvas.configure(yscrollcommand=vsb.set)
+    vsb.pack(side=_tk.RIGHT, fill=_tk.Y)
+    canvas.pack(side=_tk.LEFT, fill=_tk.BOTH, expand=True)
+    inner = ttk.Frame(canvas, style="TFrame")
+    win_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+    def _on_configure(e):
+        canvas.configure(scrollregion=canvas.bbox("all"))
+        canvas.itemconfig(win_id, width=canvas.winfo_width())
+    inner.bind("<Configure>", _on_configure)
+    canvas.bind("<Configure>", lambda e: canvas.itemconfig(win_id, width=e.width))
+
+    def _on_mousewheel(e):
+        canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+    def _on_mousewheel_linux(e):
+        canvas.yview_scroll(-1 if e.num == 4 else 1, "units")
+
+    canvas.bind("<Enter>", lambda _: canvas.bind_all("<MouseWheel>", _on_mousewheel))
+    canvas.bind("<Leave>", lambda _: canvas.unbind_all("<MouseWheel>"))
+    canvas.bind("<Enter>", lambda _: canvas.bind_all("<Button-4>", _on_mousewheel_linux), add="+")
+    canvas.bind("<Enter>", lambda _: canvas.bind_all("<Button-5>", _on_mousewheel_linux), add="+")
+    return inner
+
+
+def make_section(parent: "ttk.Frame", title: str) -> "ttk.LabelFrame":
+    """Создаёт LabelFrame с единым стилем отступов."""
+    f = ttk.LabelFrame(parent, text=title, padding=10)
+    f.pack(fill="x", padx=10, pady=6)
+    return f
+
+
+def add_row(frame: "ttk.Frame", row: int, label: str,
+            widget_factory, **kw) -> "object":
+    """Добавляет строку Label + виджет в grid-раскладку."""
+    import tkinter as _tk
+    ttk.Label(frame, text=label).grid(row=row, column=0, sticky=_tk.W, pady=4)
+    w = widget_factory(**kw)
+    w.grid(row=row, column=1, padx=8, sticky=_tk.W)
+    return w
+
 
 
 # ── Вспомогательная функция усреднения ───────────────────────────────────────
@@ -157,6 +218,12 @@ class SimulationGUI:
         self.coding_type_var      = tk.StringVar(value="hamming")
         self.turbo_iterations_var = tk.StringVar(value="6")
         self.turbo_block_size_var = tk.StringVar(value="128")
+
+        # Переменные для Reed-Solomon
+        self.rs_nsym_var          = tk.StringVar(value="10")
+        self.rs_nsize_var         = tk.StringVar(value="255")
+        self.rs_fcr_var           = tk.StringVar(value="0")
+        self.rs_prim_var          = tk.StringVar(value="0x11d")
 
         self.ebn0_start_var       = tk.StringVar(value="0")
         self.ebn0_stop_var        = tk.StringVar(value="10")
@@ -267,6 +334,15 @@ class SimulationGUI:
         self.start_btn.config(state=tk.DISABLED if running else tk.NORMAL)
         self.stop_btn.config(state=tk.NORMAL    if running else tk.DISABLED)
 
+    def _toggle_section(self, widgets: list, var: "tk.BooleanVar") -> None:
+        """Включает/выключает список виджетов по значению чекбокса."""
+        state = tk.NORMAL if var.get() else tk.DISABLED
+        for w in widgets:
+            try:
+                w.configure(state=state)
+            except tk.TclError:
+                pass
+
     # ── Виджеты ───────────────────────────────────────────────────────────────
 
     def create_widgets(self) -> None:
@@ -300,9 +376,10 @@ class SimulationGUI:
             ("🔀 Перемежение",  self._build_interleaving_tab),
         ]
         for title, builder in tabs:
-            tab = ttk.Frame(nb)
-            nb.add(tab, text=title)
-            builder(tab)
+            tab_outer = ttk.Frame(nb)
+            nb.add(tab_outer, text=title)
+            inner = make_scrollable(tab_outer)
+            builder(inner)
 
         # Кнопки управления
         btn_f = ttk.Frame(left)
@@ -404,16 +481,28 @@ class SimulationGUI:
             ttk.Entry(rf, textvariable=var, width=6).pack(side=tk.LEFT, padx=5)
 
         # Адаптивный режим и ранняя остановка
-        adv_f = ttk.LabelFrame(parent, text="Дополнительно", padding=10)
-        adv_f.pack(fill=tk.X, padx=10, pady=8)
+        self.adv_enabled_var = tk.BooleanVar(value=True)
+        adv_outer = ttk.LabelFrame(parent, text="Дополнительно", padding=10)
+        adv_outer.pack(fill=tk.X, padx=10, pady=8)
+        ttk.Checkbutton(adv_outer, text="Включить",
+                        variable=self.adv_enabled_var,
+                        command=lambda: self._toggle_section(adv_widgets, self.adv_enabled_var)
+                        ).grid(row=0, column=0, columnspan=3, sticky=tk.W, pady=(0, 4))
+        adv_f = ttk.Frame(adv_outer)
+        adv_f.grid(row=1, column=0, columnspan=3, sticky=tk.EW)
+        adv_widgets: list = []
         for row, (label, var, tip) in enumerate([
             ("Макс. бит (адаптивно):", self.max_adaptive_bits_var, "×10 при BER<1e-4, ×100 при BER<1e-5"),
             ("Ранняя остановка BER:", self.early_stop_ber_var,     "0 = отключено; напр. 1e-7"),
         ]):
-            ttk.Label(adv_f, text=label).grid(row=row, column=0, sticky=tk.W, pady=4)
-            ttk.Entry(adv_f, textvariable=var, width=14).grid(row=row, column=1, padx=8, sticky=tk.W)
-            ttk.Label(adv_f, text=tip, foreground=ACCENT_YELLOW,
-                      font=("Segoe UI", 8)).grid(row=row, column=2, sticky=tk.W, padx=4)
+            lbl = ttk.Label(adv_f, text=label)
+            lbl.grid(row=row, column=0, sticky=tk.W, pady=4)
+            ent = ttk.Entry(adv_f, textvariable=var, width=14)
+            ent.grid(row=row, column=1, padx=8, sticky=tk.W)
+            tip_lbl = ttk.Label(adv_f, text=tip, foreground=ACCENT_YELLOW,
+                      font=("Segoe UI", 8))
+            tip_lbl.grid(row=row, column=2, sticky=tk.W, padx=4)
+            adv_widgets.extend([lbl, ent, tip_lbl])
 
         # PER настройки
         per_f = ttk.LabelFrame(parent, text="PER (Packet Error Rate)", padding=10)
@@ -435,10 +524,10 @@ class SimulationGUI:
         cf.pack(anchor=tk.W, padx=15, pady=(0, 8))
         ttk.Radiobutton(cf, text="🔷 Hamming (7,4)",  variable=self.coding_type_var,
                         value="hamming").pack(anchor=tk.W, pady=2)
-        ttk.Radiobutton(cf, text="🔹 LDPC (64,32)",   variable=self.coding_type_var,
-                        value="ldpc").pack(anchor=tk.W, pady=2)
         ttk.Radiobutton(cf, text="🔸 Turbo (PCCC≈1/3)", variable=self.coding_type_var,
                         value="turbo").pack(anchor=tk.W, pady=2)
+        ttk.Radiobutton(cf, text="🔹 Reed-Solomon (байтовый)", variable=self.coding_type_var,
+                        value="reed-solomon").pack(anchor=tk.W, pady=2)
 
         # Параметры Turbo (показываются только при выборе Turbo)
         turbo_f = ttk.LabelFrame(parent, text="Параметры Turbo", padding=8)
@@ -449,28 +538,43 @@ class SimulationGUI:
             ttk.Label(turbo_f, text=label).grid(row=row, column=0, sticky=tk.W, pady=3)
             ttk.Entry(turbo_f, textvariable=var, width=10).grid(row=row, column=1, padx=8, sticky=tk.W)
 
-        def _toggle_turbo(*_: object) -> None:
+        # Параметры Reed-Solomon
+        rs_f = ttk.LabelFrame(parent, text="Параметры Reed-Solomon", padding=8)
+        for row, (label, var, default) in enumerate([
+            ("ECC символов (nsym):", self.rs_nsym_var, "10"),
+            ("Размер блока (nsize):", self.rs_nsize_var, "255"),
+            ("Первый корень (fcr):", self.rs_fcr_var, "0"),
+            ("Примитивный полином (hex):", self.rs_prim_var, "0x11d"),
+        ]):
+            ttk.Label(rs_f, text=label).grid(row=row, column=0, sticky=tk.W, pady=3)
+            entry = ttk.Entry(rs_f, textvariable=var, width=12)
+            entry.grid(row=row, column=1, padx=8, sticky=tk.W)
+
+        def _toggle_frames(*_: object) -> None:
+            # Скрываем оба фрейма
+            turbo_f.pack_forget()
+            rs_f.pack_forget()
             if self.coding_type_var.get() == "turbo":
                 turbo_f.pack(fill=tk.X, padx=15, pady=(0, 6))
-            else:
-                turbo_f.pack_forget()
+            elif self.coding_type_var.get() == "reed-solomon":
+                rs_f.pack(fill=tk.X, padx=15, pady=(0, 6))
 
-        self.coding_type_var.trace_add("write", _toggle_turbo)
-        _toggle_turbo()  # изначально скрыт (default = hamming)
+        self.coding_type_var.trace_add("write", _toggle_frames)
+        _toggle_frames()  # изначально скрыты (default = hamming)
 
         ttk.Label(parent,
                   text=("Hamming (7,4):\n"
                         "  • Быстрое декодирование\n"
                         "  • Исправляет 1 ошибку на блок\n"
                         "  • Скорость 4/7 ≈ 0.57\n\n"
-                        "LDPC (64,32) — Sum-Product BP:\n"
-                        "  • «Водопадный» эффект\n"
-                        "  • Скорость 32/64 = 0.5\n\n"
                         "Turbo (PCCC, Log-MAP):\n"
                         "  • Лучшая помехоустойчивость\n"
-                        "  • Скорость ≈ 1/3 (медленнее)"),
+                        "  • Скорость ≈ 1/3 (медленнее)\n\n"
+                        "Reed-Solomon:\n"
+                        "  • Байтовый код (исправляет пакеты ошибок)\n"
+                        "  • Исправляет до floor(nsym/2) ошибок\n"
+                        "  • nsize ≤ 255 для GF(2^8)"),
                   justify=tk.LEFT, foreground=ACCENT_YELLOW).pack(anchor=tk.W, padx=15, pady=8)
-
 
     def _build_encryption_tab(self, parent: ttk.Frame) -> None:
         """Вкладка настроек шифрования."""
@@ -486,10 +590,6 @@ class SimulationGUI:
         alg_f = ttk.LabelFrame(parent, text="Алгоритм", padding=8)
         alg_f.pack(fill=tk.X, padx=15, pady=(0, 8))
 
-        ttk.Radiobutton(alg_f, text="🔑 XOR-шифр (учебный, нет распространения ошибок)",
-                        variable=self.enc_type_var, value="xor").pack(
-            anchor=tk.W, pady=2)
-
         aes_rb = ttk.Radiobutton(
             alg_f,
             text="🔒 AES-128 (стандарт)" + ("" if _aes_ok() else "  ⚠ недоступен"),
@@ -503,7 +603,6 @@ class SimulationGUI:
         mode_f.pack(fill=tk.X, padx=15, pady=(0, 8))
 
         modes_info = [
-            ("ECB", "ECB  — независимые блоки, нет распространения ошибок"),
             ("CBC", "CBC  — цепочка, ошибка разрушает 1 блок + 1 бит следующего"),
             ("CTR", "CTR  — потоковый режим, нет распространения ошибок"),
         ]
@@ -553,7 +652,7 @@ class SimulationGUI:
                         "  BER post-decrypt — итоговый BER (основной)\n"
                         "  Распр. ошибок    — BER_post / BER_pre\n"
                         "  AES блок-ошибки  — повреждённых 128-бит блоков\n\n"
-                        "ECB и CTR: распр. ≈ 1.0\n"
+                        "CTR: распр. ≈ 1.0\n"
                         "CBC: распр. > 1.0 при средних SNR (лавинный эффект)"),
                   justify=tk.LEFT,
                   foreground=ACCENT_YELLOW).pack(anchor=tk.W, padx=15, pady=8)
@@ -599,24 +698,8 @@ class SimulationGUI:
                   justify=tk.LEFT, foreground=ACCENT_YELLOW).pack(anchor=tk.W, padx=15, pady=10)
 
     def _build_channel_tab(self, parent: ttk.Frame) -> None:
-        canvas = tk.Canvas(parent, bg=PANEL_BG, highlightthickness=0)
-        sb = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
-        sf = ttk.Frame(canvas)
-
-        def _on_mw(event: tk.Event) -> None:
-            delta = -1 if (hasattr(event, "num") and event.num == 4) or event.delta > 0 else 1
-            canvas.yview_scroll(delta, "units")
-
-        sf.bind("<Enter>", lambda _: canvas.bind_all("<MouseWheel>", _on_mw))
-        sf.bind("<Leave>", lambda _: canvas.unbind_all("<MouseWheel>"))
-        sf.bind("<Button-4>", _on_mw)
-        sf.bind("<Button-5>", _on_mw)
-        sf.bind("<Configure>", lambda _: canvas.configure(scrollregion=canvas.bbox("all")))
-
-        canvas.create_window((0, 0), window=sf, anchor="nw")
-        canvas.configure(yscrollcommand=sb.set)
-        canvas.pack(side="left", fill="both", expand=True)
-        sb.pack(side="right", fill="y")
+        # parent уже является прокручиваемым inner_frame от make_scrollable
+        sf = parent
 
         # AWGN — всегда
         af = ttk.LabelFrame(sf, text="🌊 AWGN (Белый шум)", padding=10)
@@ -624,8 +707,9 @@ class SimulationGUI:
         ttk.Label(af, text="Добавляется автоматически через Eb/N0",
                   foreground=ACCENT_YELLOW).pack(anchor=tk.W)
 
-        def _add_section(title: str, key_prefix: str, fields: list[tuple]) -> dict[str, tk.Variable]:
-            """Создаёт LabelFrame с чекбоксом-включателем и набором полей."""
+        def _add_section(title: str, key_prefix: str, fields: list[tuple]) -> tuple[dict, ttk.LabelFrame]:
+            """Создаёт LabelFrame с чекбоксом-включателем и набором полей.
+            Возвращает (vars_map, frame)."""
             enabled_var = tk.BooleanVar(value=False)
             frame = ttk.LabelFrame(sf, text=title, padding=10)
             frame.pack(fill=tk.X, padx=10, pady=8)
@@ -639,47 +723,35 @@ class SimulationGUI:
                 w = widget_class(frame, textvariable=var, **widget_kwargs)
                 w.pack(anchor=tk.W, pady=(0, 6))
                 vars_map[f"{key_prefix}_{var_key}"] = var
-            return vars_map
+            return vars_map, frame
 
         # Rayleigh
-        self.channel_vars.update(_add_section(
+        _vars, _ = _add_section(
             "📶 Rayleigh Fading (многолучевое)", "rayleigh", [
                 ("Число лучей:",              "rays",    "str", "16",  {"__class__": ttk.Spinbox, "from_": 2, "to": 64, "width": 10}),
                 ("Доплер. частота (норм.):",  "doppler", "str", "0.01", {"width": 15}),
             ]
-        ))
+        )
+        self.channel_vars.update(_vars)
 
         # Phase Noise
-        self.channel_vars.update(_add_section(
+        _vars, _ = _add_section(
             "🔄 Фазовый шум", "phase", [
                 ("Дисперсия фазы (rad²):", "variance", "str", "0.001", {"width": 15}),
             ]
-        ))
+        )
+        self.channel_vars.update(_vars)
 
-        # Frequency Offset
-        self.channel_vars.update(_add_section(
-            "📊 Частотный сдвиг", "freq", [
-                ("Норм. сдвиг (-0.1 до +0.1):", "offset", "str", "0.01", {"width": 15}),
-            ]
-        ))
-
-        # Timing Jitter
-        self.channel_vars.update(_add_section(
-            "⏱ Ошибка синхронизации", "timing", [
-                ("Диапазон смещения (Ts):", "offset", "str", "0.05", {"width": 15}),
-            ]
-        ))
-
-        # Impulse Noise
-        self.channel_vars.update(_add_section(
+        # Impulse Noise — сохраняем ссылку на frame чтобы добавить поля ширины
+        _vars, impulse_frame = _add_section(
             "⚡ Импульсные помехи", "impulse", [
                 ("Вероятность помехи:", "prob",      "str", "0.001", {"width": 15}),
                 ("Амплитуда (σ):",      "amp",       "str", "10.0",  {"width": 15}),
             ]
-        ))
-        # Ширина импульса — отдельно (два поля)
-        impulse_parent = sf.winfo_children()[-1]  # последний LabelFrame
-        w_frame = ttk.Frame(impulse_parent)
+        )
+        self.channel_vars.update(_vars)
+        # Ширина импульса — дополнительная строка прямо в impulse_frame
+        w_frame = ttk.Frame(impulse_frame)
         w_frame.pack(anchor=tk.W, pady=(0, 6))
         ttk.Label(w_frame, text="Ширина: от").pack(side=tk.LEFT, padx=4)
         wf_var = tk.StringVar(value="1")
@@ -1011,8 +1083,8 @@ class SimulationGUI:
         coding_type_val = self.coding_type_var.get()
         if coding_type_val == "hamming":
             n, k = 7, 4
-        elif coding_type_val == "ldpc":
-            n, k = 64, 32
+        elif coding_type_val == "reed-solomon":
+            n, k = 0, 0  # не используются для RS
         else:  # turbo — n/k не используются, скорость фиксирована ≈ 1/3
             n, k = 0, 0
         try:
@@ -1048,14 +1120,6 @@ class SimulationGUI:
                 "enabled":              cv["phase_enabled"].get(),
                 "phase_noise_variance": float(cv["phase_variance"].get()),
             },
-            "frequency_offset": {
-                "enabled":                cv["freq_enabled"].get(),
-                "normalized_freq_offset": float(cv["freq_offset"].get()),
-            },
-            "timing_offset": {
-                "enabled":             cv["timing_enabled"].get(),
-                "timing_offset_range": float(cv["timing_offset"].get()),
-            },
             "impulse_noise": {
                 "enabled":                  cv["impulse_enabled"].get(),
                 "impulse_probability":      float(cv["impulse_prob"].get()),
@@ -1064,6 +1128,12 @@ class SimulationGUI:
                 "impulse_width_to":         int(cv["impulse_width_to"].get()),
             },
         }
+
+        # Параметры Reed-Solomon
+        rs_nsym  = int(self.rs_nsym_var.get())
+        rs_nsize = int(self.rs_nsize_var.get())
+        rs_fcr   = int(self.rs_fcr_var.get())
+        rs_prim  = int(self.rs_prim_var.get(), 16)   # шестнадцатеричный ввод
 
         return {
             "simulation_mode": self.mode_var.get(),
@@ -1079,6 +1149,10 @@ class SimulationGUI:
                 "k":                 k,
                 "turbo_iterations":  turbo_iter,
                 "turbo_block_size":  turbo_block,
+                "rs_nsym":           rs_nsym,
+                "rs_nsize":          rs_nsize,
+                "rs_fcr":            rs_fcr,
+                "rs_prim":           rs_prim,
             },
             "channel": channel_config,
             "text_settings": {
@@ -1110,10 +1184,7 @@ class SimulationGUI:
                 "enabled": self.il_enabled_var.get(),
                 "depth":   int(self.il_depth_var.get()),
             },
-            "text_recovery": {
-                "enabled":      self.tr_enabled_var.get(),
-                "window_bytes": int(self.tr_window_var.get()),
-            },
+
         }
 
     # ── Управление симуляцией ─────────────────────────────────────────────────

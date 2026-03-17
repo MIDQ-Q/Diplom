@@ -6,8 +6,6 @@
   - RayleighFadingChannel    : частотно-плоские замирания (модель Jakes)
   - MultipathChannel         : многолучёвое распространение с ISI (FIR-канал + Jakes на каждом отводе)
   - PhaseNoiseChannel        : фазовый шум (случайное блуждание, модель Wiener)
-  - FrequencyOffsetChannel   : сдвиг несущей частоты (CFO) с дрейфом
-  - TimingOffsetChannel      : тайминговая ошибка
   - ImpulseNoiseChannel      : импульсные помехи (модель Бернулли–Гаусса)
   - ShadowingChannel         : медленные замирания (log-normal shadowing)
   - CompositeChannelModel    : последовательное объединение каналов с единым AWGN
@@ -342,110 +340,6 @@ class PhaseNoiseChannel(ChannelModel):
 
 
 # ---------------------------------------------------------------------------
-# Frequency Offset (CFO) с дрейфом
-# ---------------------------------------------------------------------------
-
-class FrequencyOffsetChannel(ChannelModel):
-    """
-    Сдвиг несущей частоты (Carrier Frequency Offset, CFO) с медленным дрейфом.
-
-    Физика: расхождение тактовых генераторов передатчика и приёмника.
-    Дрейф моделирует температурную нестабильность (TCXO/VCXO).
-
-    Модель:
-        φ_cfo[n] = 2π · Σ_{k=0}^{n} f_offset[k]
-        y[n] = x[n] · exp(j·φ_cfo[n]) + w[n]
-
-    f_offset[n] — нормированный CFO с медленным случайным блужданием:
-        f_offset[n] = f_offset[n-1] + drift[n],  drift[n] ~ N(0, σ²_drift)
-
-    Параметры config:
-        enabled                  : bool
-        normalized_freq_offset   : float, начальный нормированный CFO (f/f_sym),
-                                   типично 1e-5 – 1e-3
-        cfo_drift_std            : float, СКО шага дрейфа (по умолчанию 0),
-                                   0 → постоянный CFO без дрейфа
-    """
-
-    def __init__(self, config: Dict):
-        super().__init__(config)
-        self.name = "Frequency Offset"
-        self.f0 = config.get("normalized_freq_offset", 0.0)
-        self.drift_std = config.get("cfo_drift_std", 0.0)
-
-    def apply_with_coeff(self, tx_symbols: np.ndarray, snr_linear: float,
-                         add_noise: bool = True) -> Tuple[np.ndarray, np.ndarray]:
-        if not self.config.get("enabled", False):
-            return tx_symbols.copy(), np.ones(len(tx_symbols), dtype=complex)
-
-        n = len(tx_symbols)
-
-        # Дрейф CFO
-        if self.drift_std > 0:
-            drift = self.drift_std * np.random.randn(n)
-            freq = self.f0 + np.cumsum(drift)
-        else:
-            freq = np.full(n, self.f0)
-
-        phase = 2.0 * np.pi * np.cumsum(freq)
-        h = np.exp(1j * phase)
-        rx = tx_symbols * h
-
-        if add_noise:
-            signal_power = float(np.mean(np.abs(tx_symbols) ** 2))
-            if signal_power == 0.0:
-                signal_power = 1.0
-            rx = rx + _awgn_noise(n, snr_linear, signal_power)
-
-        return rx, h
-
-
-# ---------------------------------------------------------------------------
-# Timing Offset
-# ---------------------------------------------------------------------------
-
-class TimingOffsetChannel(ChannelModel):
-    """
-    Тайминговая ошибка (дробный сдвиг момента выборки).
-
-    Физика: несинхронность тактового генератора приёмника приводит к тому,
-    что символы выбираются не в оптимальный момент, что вносит фазовый сдвиг.
-
-    Упрощённая модель (без интерполяции):
-        y[n] = x[n] · exp(j·2π·τ[n]) + w[n]
-        τ[n] ~ Uniform(-τ_max, +τ_max)  [нормировано в долях символьного интервала]
-
-    Параметры config:
-        enabled              : bool
-        timing_offset_range  : float, максимальная тайминговая ошибка (τ_max, доли символа)
-                               Типично 0.0 – 0.5
-    """
-
-    def __init__(self, config: Dict):
-        super().__init__(config)
-        self.name = "Timing Offset"
-        self.tau_max = config.get("timing_offset_range", 0.0)
-
-    def apply_with_coeff(self, tx_symbols: np.ndarray, snr_linear: float,
-                         add_noise: bool = True) -> Tuple[np.ndarray, np.ndarray]:
-        if not self.config.get("enabled", False) or self.tau_max == 0.0:
-            return tx_symbols.copy(), np.ones(len(tx_symbols), dtype=complex)
-
-        n = len(tx_symbols)
-        tau = np.random.uniform(-self.tau_max, self.tau_max, n)
-        h = np.exp(1j * 2.0 * np.pi * tau)
-        rx = tx_symbols * h
-
-        if add_noise:
-            signal_power = float(np.mean(np.abs(tx_symbols) ** 2))
-            if signal_power == 0.0:
-                signal_power = 1.0
-            rx = rx + _awgn_noise(n, snr_linear, signal_power)
-
-        return rx, h
-
-
-# ---------------------------------------------------------------------------
 # Impulse Noise (Бернулли–Гаусс)
 # ---------------------------------------------------------------------------
 
@@ -588,11 +482,9 @@ class CompositeChannelModel:
         1. Shadowing          (если включён)
         2. Rayleigh Fading    (если включён)
         3. Multipath          (если включён; взаимоисключает Rayleigh)
-        4. Frequency Offset   (если включён)
-        5. Phase Noise        (если включён)
-        6. Timing Offset      (если включён)
-        7. Единый AWGN
-        8. Impulse Noise      (если включён; добавляет собственный AWGN + импульсы)
+        4. Phase Noise        (если включён)
+        5. Единый AWGN
+        6. Impulse Noise      (если включён; добавляет собственный AWGN + импульсы)
 
     Примечание: Rayleigh и Multipath взаимоисключают друг друга.
     Если оба включены, приоритет у Multipath.
@@ -603,10 +495,7 @@ class CompositeChannelModel:
         "rayleigh":         {"enabled": False, "n_rays": 16, "normalized_doppler": 0.01},
         "multipath":        {"enabled": False, "n_taps": 6, "normalized_doppler": 0.01,
                              "n_rays": 16, "pdp_decay": 1.0},
-        "frequency_offset": {"enabled": False, "normalized_freq_offset": 1e-4,
-                             "cfo_drift_std": 0.0},
         "phase_noise":      {"enabled": False, "phase_noise_std_deg": 1.0},
-        "timing_offset":    {"enabled": False, "timing_offset_range": 0.1},
         "impulse_noise":    {"enabled": False, "impulse_probability": 0.001,
                              "impulse_snr_dB": 20.0,
                              "impulse_width_min": 1, "impulse_width_max": 5},
@@ -633,17 +522,9 @@ class CompositeChannelModel:
         elif cfg.get("rayleigh", {}).get("enabled", False):
             self.pre_noise_channels.append(RayleighFadingChannel(cfg["rayleigh"]))
 
-        # 3. Frequency Offset
-        if cfg.get("frequency_offset", {}).get("enabled", False):
-            self.pre_noise_channels.append(FrequencyOffsetChannel(cfg["frequency_offset"]))
-
-        # 4. Phase Noise
+        # 3. Phase Noise
         if cfg.get("phase_noise", {}).get("enabled", False):
             self.pre_noise_channels.append(PhaseNoiseChannel(cfg["phase_noise"]))
-
-        # 5. Timing Offset
-        if cfg.get("timing_offset", {}).get("enabled", False):
-            self.pre_noise_channels.append(TimingOffsetChannel(cfg["timing_offset"]))
 
         # Impulse Noise обрабатывается отдельно (имеет встроенный AWGN)
         self.impulse_channel: Optional[ImpulseNoiseChannel] = None
@@ -653,10 +534,11 @@ class CompositeChannelModel:
         # Базовый AWGN (всегда присутствует как резерв)
         self.awgn_channel = AWGNChannel(cfg.get("awgn", {"enabled": True}))
 
-        logger.info(f"CompositeChannel pipeline: "
-                    f"{[ch.name for ch in self.pre_noise_channels]}"
-                    f"{' + ImpulseNoise' if self.impulse_channel else ''}"
-                    f" + AWGN")
+        logger.info(
+            "CompositeChannel pipeline: %s%s + AWGN",
+            [ch.name for ch in self.pre_noise_channels],
+            " + ImpulseNoise" if self.impulse_channel else "",
+        )
 
     def apply_with_coeff(self, tx_symbols: np.ndarray,
                          snr_linear: float) -> Tuple[np.ndarray, np.ndarray]:
@@ -683,10 +565,8 @@ class CompositeChannelModel:
             signal_power = 1.0
         rx = rx + _awgn_noise(n, snr_linear, signal_power)
 
-        # --- Шаг 3: импульсный шум (уже содержит свой AWGN) ---
+        # --- Шаг 3: импульсный шум ---
         if self.impulse_channel is not None:
-            # Передаём rx как «символы», add_noise=False чтобы не дублировать AWGN
-            # Impulse канал добавит только импульсы поверх уже зашумлённого сигнала
             rx, _ = self.impulse_channel.apply_with_coeff(rx, snr_linear, add_noise=False)
 
         return rx, h_total

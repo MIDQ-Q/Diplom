@@ -1,43 +1,15 @@
 """
-simulation.py — Ядро симуляции цифровой связи.
-Python 3.12+
+simulation.py — Ядро симуляции цифровой связи. Python 3.12+
 
-Изменения (2 марта):
-─────────────────────────────────────────────────────────────────────
-create_coder():
-  • Поддержка TurboCoder (coding_type = "turbo").
-  • Корректные (n, k) по умолчанию: Hamming(7,4), LDPC(64,32).
+Пайплайн TX: данные → шифр → FEC → модуляция
+Пайплайн RX: демодуляция → FEC → дешифр → сравнение
 
-_log_config():
-  • Убран Rician из описания каналов.
-  • Shadowing и Multipath добавлены.
-  • Логирование PER packet_size.
-
-_run_pipeline() [новое]:
-  • Единый внутренний пайплайн: кодирование → модуляция → канал → декодирование → метрики.
-  • Возвращает 'decoded_bits' (np.ndarray) для использования в text-режиме.
-  • simulate_transmission / simulate_text_transmission — тонкие обёртки над ним.
-
-simulate_transmission() / simulate_text_transmission():
-  • Адаптивное число бит:
-      prev_ber < 1e-5  → ×100   (до max_adaptive_bits = 10 млн)
-      prev_ber < 1e-4  → ×10
-      иначе            → base_bits
-  • PER (Packet Error Rate): packet_size через config["per_settings"].
-  • Время encode/decode — из coder и замера time.perf_counter().
-  • Ранняя остановка: флаг early_stop=True если ber < early_stop_ber.
-  • Поле rayleigh_theoretical_ber в каждой точке.
-
-plot_and_save_results():
-  • show_rayleigh_theo — флаг для кривых Rayleigh (оранжевый пунктир).
-  • График PER как отдельный subplot.
-  • Аннотация coding_gain на BER-графике.
-
-save_results_to_text():
-  • Колонки: Rayleigh-теория, PER, время encode/decode, coding_gain.
+Кодирование: Hamming (7,4), Turbo (PCCC ≈ 1/3), Reed-Solomon (RSCodec)
+Шифрование:  AES-128-CBC, AES-128-CTR
+Модуляция:   M-PSK, M-QAM
 """
 
-import os
+from pathlib import Path
 import logging
 import time
 import numpy as np
@@ -54,11 +26,15 @@ from modulation import (
     theoretical_ber_qam, theoretical_ser_qam,
     theoretical_ber_rayleigh_psk, theoretical_ber_rayleigh_qam,
 )
-from coding import HammingCoder, LDPCCoder, TurboCoder, compute_coding_gain
+from coding import (
+    HammingCoder,
+    TurboCoder,
+    ReedSolomonCoder,          # новый класс
+    compute_coding_gain,
+)
 from results_manager import ResultsManager
 from channel import CompositeChannelModel
 from interleaving import get_interleaver
-from text_recovery import recover_text, RecoveryResult
 
 results_manager = ResultsManager()
 logger = logging.getLogger(__name__)
@@ -121,42 +97,44 @@ def create_modulator(config: dict) -> PSKModulator | QAMModulator:
     mod_type = config["modulation"]["type"]
     order    = config["modulation"]["order"]
     use_gray = config["modulation"]["use_gray_code"]
-    if mod_type == "PSK":
-        return PSKModulator(M=order, use_gray_code=use_gray)
-    if mod_type == "QAM":
-        return QAMModulator(M=order, use_gray_code=use_gray)
-    raise ValueError(f"Неизвестный тип модуляции: {mod_type}")
+    match mod_type:
+        case "PSK": return PSKModulator(M=order, use_gray_code=use_gray)
+        case "QAM": return QAMModulator(M=order, use_gray_code=use_gray)
+        case _:     raise ValueError(f"Неизвестный тип модуляции: {mod_type}")
 
 
 def create_coder(
     config: dict,
-) -> tuple[HammingCoder | LDPCCoder | TurboCoder | None, float]:
+) -> tuple[HammingCoder | TurboCoder | ReedSolomonCoder | None, float]:
     """
     Возвращает (coder | None, code_rate).
 
-    Поддерживаемые типы: "hamming", "ldpc", "turbo", (отсутствует → None).
-    TurboCoder имеет фиксированную скорость кода ≈ 1/3.
+    Поддерживаемые типы: "hamming", "turbo", "reed-solomon", (отсутствует → None).
     """
     if not config["coding"]["enabled"]:
         return None, 1.0
 
     coding_type = config["coding"]["type"]
 
-    if coding_type == "hamming":
-        n, k = config["coding"].get("n", 7), config["coding"].get("k", 4)
-        return HammingCoder(n=n, k=k), k / n
-
-    if coding_type == "ldpc":
-        n, k = config["coding"].get("n", 64), config["coding"].get("k", 32)
-        return LDPCCoder(n=n, k=k), k / n
-
-    if coding_type == "turbo":
-        num_iter   = config["coding"].get("turbo_iterations", 6)
-        block_size = config["coding"].get("turbo_block_size", 128)
-        coder = TurboCoder(num_iter=num_iter, block_size=block_size)
-        return coder, coder.code_rate
-
-    raise ValueError(f"Неизвестный тип кодирования: {coding_type!r}")
+    match coding_type:
+        case "hamming":
+            n, k = config["coding"].get("n", 7), config["coding"].get("k", 4)
+            return HammingCoder(n=n, k=k), k / n
+        case "turbo":
+            coder = TurboCoder(
+                num_iter=config["coding"].get("turbo_iterations", 6),
+                block_size=config["coding"].get("turbo_block_size", 128),
+            )
+            return coder, coder.code_rate
+        case "reed-solomon" | "rs":
+            nsym   = config["coding"].get("rs_nsym", 10)
+            nsize  = config["coding"].get("rs_nsize", 255)
+            fcr    = config["coding"].get("rs_fcr", 0)
+            prim   = config["coding"].get("rs_prim", 0x11d)
+            coder = ReedSolomonCoder(nsym=nsym, nsize=nsize, fcr=fcr, prim=prim)
+            return coder, coder.code_rate
+        case _:
+            raise ValueError(f"Неизвестный тип кодирования: {coding_type!r}")
 
 
 def theoretical_ber(config: dict, ebn0_dB: float) -> float:
@@ -283,6 +261,10 @@ def _log_config(config: dict, mode: str,
         ct = config["coding"]["type"]
         if ct == "turbo":
             lines.append("Кодирование: Turbo (PCCC), скорость ≈ 1/3")
+        elif ct == "reed-solomon" or ct == "rs":
+            nsym = config["coding"].get("rs_nsym", 10)
+            nsize = config["coding"].get("rs_nsize", 255)
+            lines.append(f"Кодирование: Reed-Solomon (nsym={nsym}, nsize={nsize}), скорость ≈ {nsize-nsym}/{nsize}")
         else:
             n, k = config["coding"].get("n", "?"), config["coding"].get("k", "?")
             lines.append(f"Кодирование: {ct} ({n},{k}), скорость={k}/{n}")
@@ -296,8 +278,6 @@ def _log_config(config: dict, mode: str,
         ("multipath",        lambda c: f"Multipath(taps={c.get('n_taps', 6)}, доплер={c.get('normalized_doppler', 0.01)})"),
         ("shadowing",        lambda c: f"Shadowing(std={c.get('shadow_std_dB', 8.0)}дБ)"),
         ("phase_noise",      lambda c: f"PhaseNoise(σ²={c.get('phase_noise_variance', '?')})"),
-        ("frequency_offset", lambda c: f"FreqOffset(δf={c.get('normalized_freq_offset', '?')})"),
-        ("timing_offset",    lambda c: f"TimingOffset(range={c.get('timing_offset_range', '?')})"),
         ("impulse_noise",    lambda c: (
             f"ImpulseNoise(p={c.get('impulse_probability', '?')}, "
             f"A={c.get('impulse_amplitude_sigma', '?')}σ, "
@@ -386,6 +366,12 @@ def _run_pipeline(
     tx_bits = coder.encode(encrypted_bits) if coder is not None else encrypted_bits.copy()
     encode_time_ms = (time.perf_counter() - t_enc) * 1e3
 
+    # ── Перемежение (TX) ─────────────────────────────────────────────────────
+    interleaver = get_interleaver(config)
+    tx_bits_len_before_il = len(tx_bits)  # длина до интерливинга (без padding)
+    if interleaver is not None:
+        tx_bits = interleaver.interleave(tx_bits)
+
     # ── Модуляция + канал ────────────────────────────────────────────────────
     tx_symbols = mod.modulate(tx_bits)
     bps        = mod.bits_per_symbol
@@ -393,6 +379,12 @@ def _run_pipeline(
     snr_lin    = ebn0_lin * code_rate * bps
     rx_symbols, channel_coeff = channel.apply_with_coeff(tx_symbols, snr_lin)
     rx_bits = mod.demodulate(rx_symbols, channel_coeff)
+
+    # ── Деинтерливинг (RX) ──────────────────────────────────────────────────
+    if interleaver is not None:
+        # Обрезаем до длины TX-потока (модулятор мог добавить padding по bps)
+        rx_bits = rx_bits[:len(tx_bits)]
+        rx_bits = interleaver.deinterleave(rx_bits, original_len=tx_bits_len_before_il)
 
     # ── Декодирование ────────────────────────────────────────────────────────
     t_dec = time.perf_counter()
@@ -587,27 +579,7 @@ def simulate_text_transmission(config: dict,
     # ── Text-специфичные поля ────────────────────────────────────────────────
     encoding = config["text_settings"]["text_encoding"]
 
-    # Восстановление текста: TextRecovery если включён, иначе стандартный путь
-    tr_cfg = config.get("text_recovery", {})
-    if tr_cfg.get("enabled", False):
-        rec = recover_text(
-            result["decoded_bits"],
-            original_len=len(text),
-            encoding=encoding,
-            window_bytes=tr_cfg.get("window_bytes", 3),
-        )
-        decoded_text = rec.text
-        result["recovery_stats"] = {
-            "chars_ok":      rec.chars_ok,
-            "chars_fixed":   rec.chars_fixed,
-            "chars_lost":    rec.chars_lost,
-            "total_chars":   rec.total_chars,
-            "recovery_rate": rec.recovery_rate,
-            "repair_ms":     rec.repair_time_ms,
-        }
-    else:
-        decoded_text = bits_to_text(result["decoded_bits"], encoding)
-        result["recovery_stats"] = None
+    decoded_text = bits_to_text(result["decoded_bits"], encoding)
 
     text_comparison = compare_texts(text, decoded_text)
 
@@ -636,14 +608,12 @@ def save_results_to_text(config: dict,
     Сохраняет результаты в текстовый файл.
     Включает: Rayleigh-теорию, PER, время encode/decode, coding_gain.
     """
-    os.makedirs(output_dir, exist_ok=True)
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
     mod_type  = config["modulation"]["type"]
     order     = config["modulation"]["order"]
     mode_abbr = "Text" if mode == "text" else "Random"
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename  = os.path.join(
-        output_dir, f"results_{mod_type}{order}_{mode_abbr}_{timestamp}.txt"
-    )
+    filename  = str(Path(output_dir) / f"results_{mod_type}{order}_{mode_abbr}_{timestamp}.txt")
 
     ber_arr  = np.array([r["ber"] for r in results])
     theo_arr = np.array([r.get("theoretical_ber", 0) for r in results])
@@ -670,6 +640,11 @@ def save_results_to_text(config: dict,
             ct = config["coding"]["type"]
             if ct == "turbo":
                 f.write("  Тип кода:            Turbo (PCCC), скорость ≈ 1/3\n")
+            elif ct == "reed-solomon" or ct == "rs":
+                nsym = config["coding"].get("rs_nsym", 10)
+                nsize = config["coding"].get("rs_nsize", 255)
+                f.write(f"  Тип кода:            Reed-Solomon (nsym={nsym}, nsize={nsize})\n")
+                f.write(f"  Скорость кода:       {(nsize-nsym)}/{nsize} ≈ {(nsize-nsym)/nsize:.3f}\n")
             else:
                 n, k = config["coding"].get("n", "?"), config["coding"].get("k", "?")
                 f.write(f"  Тип кода:            ({n},{k})\n")
@@ -752,14 +727,12 @@ def plot_and_save_results(config: dict,
     if not results:
         return None, None
 
-    os.makedirs(output_dir, exist_ok=True)
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
     mod_type  = config["modulation"]["type"]
     order     = config["modulation"]["order"]
     mode_abbr = "Text" if mode == "text" else "Random"
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    plot_filename = os.path.join(
-        output_dir, f"Plot_{mod_type}{order}_{mode_abbr}_{timestamp}.png"
-    )
+    plot_filename = str(Path(output_dir) / f"Plot_{mod_type}{order}_{mode_abbr}_{timestamp}.png")
 
     snr = np.array([r["snr"]         for r in results])
     ber = np.array([r["ber"]         for r in results])
@@ -917,9 +890,9 @@ def plot_comparison(
     if not results_list or not any(results_list):
         return None, None
 
-    os.makedirs(output_dir, exist_ok=True)
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
     timestamp     = datetime.now().strftime("%Y%m%d_%H%M%S")
-    plot_filename = os.path.join(output_dir, f"Compare_{timestamp}.png")
+    plot_filename = str(Path(output_dir) / f"Compare_{timestamp}.png")
 
     BG = "#1a1a2e"
     plt.style.use("dark_background")
