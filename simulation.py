@@ -19,6 +19,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+from config_utils import normalize_config
 from encryption import get_cipher, compute_encryption_stats, aes_available
 from modulation import (
     PSKModulator, QAMModulator,
@@ -32,11 +33,10 @@ from coding import (
     ReedSolomonCoder,          # новый класс
     compute_coding_gain,
 )
-from results_manager import ResultsManager
 from channel import CompositeChannelModel
 from interleaving import get_interleaver
+from waveform_phy import WaveformPhy
 
-results_manager = ResultsManager()
 logger = logging.getLogger(__name__)
 
 
@@ -257,6 +257,20 @@ def _log_config(config: dict, mode: str,
         (f"Модуляция: {config['modulation']['type']}-{config['modulation']['order']}, "
          f"Код Грея: {config['modulation']['use_gray_code']}"),
     ]
+
+    wf = config.get("waveform", {})
+    if wf.get("enabled", False):
+        sps = wf.get("sps", "?")
+        beta = wf.get("rrc_beta", "?")
+        span = wf.get("rrc_span_symbols", "?")
+        cfo = wf.get("cfo", {})
+        cfo_label = (
+            f", CFO_norm={cfo.get('cfo_norm', 0.0)}"
+            if cfo.get("enabled", False) else ""
+        )
+        lines.append(f"Waveform: sps={sps}, RRC(beta={beta}, span={span}){cfo_label}")
+    else:
+        lines.append("Waveform: symbol-rate (1 отсчёт/символ)")
     if config["coding"]["enabled"]:
         ct = config["coding"]["type"]
         if ct == "turbo":
@@ -275,13 +289,11 @@ def _log_config(config: dict, mode: str,
     active_ch: list[str] = []
     channel_log_map = [
         ("rayleigh",         lambda c: f"Rayleigh(n_rays={c.get('n_rays', 16)}, доплер={c.get('normalized_doppler', 0.01)})"),
-        ("multipath",        lambda c: f"Multipath(taps={c.get('n_taps', 6)}, доплер={c.get('normalized_doppler', 0.01)})"),
-        ("shadowing",        lambda c: f"Shadowing(std={c.get('shadow_std_dB', 8.0)}дБ)"),
-        ("phase_noise",      lambda c: f"PhaseNoise(σ²={c.get('phase_noise_variance', '?')})"),
+        ("phase_noise",      lambda c: f"PhaseNoise(σ={c.get('phase_noise_std_deg', '?')}°)"),
         ("impulse_noise",    lambda c: (
-            f"ImpulseNoise(p={c.get('impulse_probability', '?')}, "
-            f"A={c.get('impulse_amplitude_sigma', '?')}σ, "
-            f"ширина={c.get('impulse_width_from', 1)}-{c.get('impulse_width_to', 5)})"
+            f"ImpulseNoise(mode={c.get('mode', 'bernoulli')}, "
+            f"snr={c.get('impulse_snr_dB', 20.0)}дБ, "
+            f"p={c.get('impulse_probability', 0.001)})"
         )),
     ]
     for key, label_fn in channel_log_map:
@@ -341,7 +353,21 @@ def _run_pipeline(
     """
     mod              = create_modulator(config)
     coder, code_rate = create_coder(config)
-    channel          = CompositeChannelModel(config.get("channel", {}))
+    channel_cfg      = config.get("channel", {})
+    channel          = CompositeChannelModel(channel_cfg)
+
+    # ── Опциональные метрики (важно: инициализировать для symbol-rate режима) ──
+    evm_before = None
+    evm_after = None
+    const_before = None
+    const_after = None
+    eye_before = None
+    eye_after = None
+    eye_metrics = None
+    evm_over_time = None
+    timing_stats: dict = {"timing_enabled": False}
+    cfo_stats: dict = {"enabled": False}
+    adc_stats: dict = {"enabled": False}
 
     # ── Шифрование (до кодирования) ──────────────────────────────────────────
     enc_cfg  = config.get("encryption", {})
@@ -376,9 +402,771 @@ def _run_pipeline(
     tx_symbols = mod.modulate(tx_bits)
     bps        = mod.bits_per_symbol
     ebn0_lin   = 10.0 ** (ebn0_dB / 10.0)
-    snr_lin    = ebn0_lin * code_rate * bps
-    rx_symbols, channel_coeff = channel.apply_with_coeff(tx_symbols, snr_lin)
-    rx_bits = mod.demodulate(rx_symbols, channel_coeff)
+    snr_lin    = ebn0_lin * code_rate * bps   # Es/N0 (линейный) для символов
+
+    wf_cfg = config.get("waveform", {})
+    wf_enabled = bool(wf_cfg.get("enabled", False))
+
+    if wf_enabled:
+        wf_out = WaveformPhy(wf_cfg).run(mod=mod, tx_symbols=tx_symbols, snr_lin=snr_lin)
+        rx_bits = wf_out["rx_bits"]
+        channel_names = wf_out["channel_names"]
+        timing_stats = wf_out.get("timing_stats", {"timing_enabled": False})
+        cfo_stats = wf_out.get("cfo_stats", {"enabled": False})
+        adc_stats = wf_out.get("adc_stats", {"enabled": False})
+        evm_before = wf_out.get("evm_before")
+        evm_after = wf_out.get("evm_after")
+        const_before = wf_out.get("const_before")
+        const_after = wf_out.get("const_after")
+        eye_before = wf_out.get("eye_before")
+        eye_after = wf_out.get("eye_after")
+        eye_metrics = wf_out.get("eye_metrics")
+        evm_over_time = wf_out.get("evm_over_time")
+
+        """
+        Legacy inline waveform-branch code is preserved below for reference,
+        but is no longer executed (moved to waveform_phy.py).
+
+        # Discrete-time waveform: sps>1 + RRC(TX/RX) + AWGN on samples (+CFO optional)
+        sps = int(wf_cfg.get("sps", 8))
+        beta = float(wf_cfg.get("rrc_beta", 0.35))
+        span = int(wf_cfg.get("rrc_span_symbols", 10))
+        cfo_enabled = bool(wf_cfg.get("cfo", {}).get("enabled", False))
+        cfo_norm = float(wf_cfg.get("cfo", {}).get("cfo_norm", 0.0))  # cycles/sample
+        cfo_recovery_enabled = bool(wf_cfg.get("cfo", {}).get("recovery_enabled", True))
+        pll_alpha = float(wf_cfg.get("cfo", {}).get("pll_alpha", 0.02))
+        pll_beta = float(wf_cfg.get("cfo", {}).get("pll_beta", 0.0004))
+        preamble_enabled = bool(wf_cfg.get("cfo", {}).get("preamble_enabled", True))
+        pre_half_len = int(wf_cfg.get("cfo", {}).get("preamble_half_len_symbols", 64))
+        loop_type = str(wf_cfg.get("cfo", {}).get("loop_type", "dd_pll")).lower().strip()
+        ml_bw = float(wf_cfg.get("cfo", {}).get("ml_search_bw", 0.004))
+        ml_grid = int(wf_cfg.get("cfo", {}).get("ml_grid_points", 401))
+
+        # Если петля отключена, повышаем точность за счёт более длинной преамбулы.
+        # Это реалистично: без сопровождения нужен более длинный пилот/преамбула.
+        pll_off = (pll_alpha <= 0.0 and pll_beta <= 0.0)
+        if pll_off and preamble_enabled and pre_half_len < 256:
+            pre_half_len = 256
+
+        h_rrc = rrc_taps(beta=beta, span_symbols=span, sps=sps)
+
+        # ── Training sequence (не завязана на CFO) ──────────────────────────
+        tr_cfg = wf_cfg.get("training", {}) if isinstance(wf_cfg.get("training", {}), dict) else {}
+        tr_enabled = bool(tr_cfg.get("enabled", False))
+        tr_len = int(tr_cfg.get("length_symbols", 128))
+        tr_seed = tr_cfg.get("seed", 12345)
+        tx_training = None
+        if tr_enabled and tr_len > 0:
+            rng_tr = np.random.default_rng(seed=tr_seed)
+            tx_training = mod.constellation_points[
+                rng_tr.integers(0, len(mod.constellation_points), size=tr_len)
+            ]
+
+        # ── CFO preamble (2 одинаковые половины) ─────────────────────────────
+        pre_len_total = 0
+        tx_preamble = None
+        if cfo_enabled and cfo_recovery_enabled and preamble_enabled and pre_half_len > 0:
+            rng = np.random.default_rng(seed=pre_half_len)
+            pre_half = mod.constellation_points[
+                rng.integers(0, len(mod.constellation_points), size=pre_half_len)
+            ]
+            preamble = np.concatenate([pre_half, pre_half])
+            pre_len_total = len(preamble)
+            tx_preamble = preamble
+            tx_symbols_wf = np.concatenate([preamble, tx_symbols])
+        else:
+            tx_symbols_wf = tx_symbols
+
+        # ── Pilots in data (symbol-rate) ─────────────────────────────────────
+        pilots_cfg = wf_cfg.get("pilots", {}) if isinstance(wf_cfg.get("pilots", {}), dict) else {}
+        pilots_enabled = bool(pilots_cfg.get("enabled", False))
+        pilot_period = int(pilots_cfg.get("period_symbols", 256))
+        pilot_len = int(pilots_cfg.get("length_symbols", 16))
+        pilot_seed = pilots_cfg.get("seed", 4242)
+        tx_pilot = None
+        if pilots_enabled and pilot_period > 0 and pilot_len > 0:
+            rng_p = np.random.default_rng(seed=pilot_seed)
+            tx_pilot = mod.constellation_points[
+                rng_p.integers(0, len(mod.constellation_points), size=pilot_len)
+            ]
+            # вставляем пилот перед каждым блоком данных длиной pilot_period
+            data = tx_symbols_wf
+            chunks = []
+            for start in range(0, len(data), pilot_period):
+                chunks.append(tx_pilot)
+                chunks.append(data[start:start + pilot_period])
+            tx_symbols_wf = np.concatenate(chunks)
+
+        # Добавляем training в самое начало (перед CFO-переамбулой/пилотами)
+        if tx_training is not None:
+            tx_symbols_wf = np.concatenate([tx_training, tx_symbols_wf])
+
+        # Сохраняем “истину” TX для метрик/графиков (training/CFO/pilots включены)
+        tx_symbols_wf_full = tx_symbols_wf.copy()
+
+        tx_samples = pulse_shaping_tx(tx_symbols_wf, h_rrc=h_rrc, sps=sps, calibrate=True)
+        if cfo_enabled and abs(cfo_norm) > 0.0:
+            tx_samples = apply_cfo(tx_samples, cfo_norm=cfo_norm)
+
+        # TDL multipath on samples (FIR)
+        tdl_cfg = wf_cfg.get("tdl", {}) if isinstance(wf_cfg.get("tdl", {}), dict) else {}
+        tdl_enabled = bool(tdl_cfg.get("enabled", False))
+        h_tdl = np.array([1.0 + 0.0j], dtype=complex)
+        if tdl_enabled:
+            delays_sym = tdl_cfg.get("delays_symbols", [0, 1, 3])
+            powers_dB = tdl_cfg.get("powers_dB", [0.0, -3.0, -6.0])
+            fading = str(tdl_cfg.get("fading", "rayleigh"))
+            frac_taps = int(tdl_cfg.get("frac_taps", 21))
+            seed = tdl_cfg.get("seed", None)
+            rng_tdl = np.random.default_rng(seed=seed) if seed is not None else np.random.default_rng()
+            h_tdl = tdl_taps_from_symbol_delays(
+                sps=sps,
+                delays_symbols=list(delays_sym),
+                powers_dB=list(powers_dB),
+                normalize=True,
+                fading=fading,
+                rng=rng_tdl,
+                frac_taps=frac_taps,
+            )
+            tx_samples = apply_tdl(tx_samples, h_tdl)
+
+        # Phase noise (Wiener) on samples (RX LO-like impairment)
+        pn_cfg = wf_cfg.get("phase_noise", {}) if isinstance(wf_cfg.get("phase_noise", {}), dict) else {}
+        pn_enabled = bool(pn_cfg.get("enabled", False))
+
+        # AWGN на отсчётах.
+        # В waveform-режиме мы калибруем RRC так, что после matched filter
+        # выборка в момент символа имеет Es ≈ 1. Тогда:
+        #   N0 = Es / (Es/N0) = 1 / snr_lin
+        #   sigma^2 (на I и Q) = N0/2 = 1/(2*snr_lin)
+        sigma = np.sqrt(1.0 / (2.0 * max(snr_lin, 1e-30)))
+        noise = sigma * (np.random.randn(len(tx_samples)) + 1j * np.random.randn(len(tx_samples)))
+        rx_samples = tx_samples + noise
+        if pn_enabled:
+            # step_std can be given in degrees or radians
+            if "step_std_deg" in pn_cfg:
+                step_std_rad = float(pn_cfg.get("step_std_deg", 0.0)) * np.pi / 180.0
+            else:
+                step_std_rad = float(pn_cfg.get("step_std_rad", 0.0))
+            rx_samples = apply_phase_noise_wiener(
+                rx_samples,
+                step_std_rad=step_std_rad,
+                seed=(int(pn_cfg.get("seed")) if pn_cfg.get("seed", None) is not None else None),
+            )
+
+        # Timing impairments on samples (ADC clock offset/drift/jitter)
+        ti_cfg = wf_cfg.get("timing_impairments", {}) if isinstance(wf_cfg.get("timing_impairments", {}), dict) else {}
+        ti_enabled = bool(ti_cfg.get("enabled", False))
+        if ti_enabled:
+            ppm = float(ti_cfg.get("drift_ppm", 0.0))
+            drift_rate = ppm * 1e-6
+            rx_samples = time_warp_samples(
+                rx_samples,
+                offset_samples=float(ti_cfg.get("offset_samples", 0.0)),
+                drift_rate=drift_rate,
+                jitter_std_samples=float(ti_cfg.get("jitter_std_samples", 0.0)),
+                jitter_mode=str(ti_cfg.get("jitter_mode", "white")),
+                jitter_pll_bw_norm=float(ti_cfg.get("jitter_pll_bw_norm", 0.01)),
+                seed=(int(ti_cfg.get("seed")) if ti_cfg.get("seed", None) is not None else None),
+            )
+
+        # AGC + clipping + ADC quantization (receiver front-end)
+        adc_cfg = wf_cfg.get("adc", {}) if isinstance(wf_cfg.get("adc", {}), dict) else {}
+        adc_enabled = bool(adc_cfg.get("enabled", False))
+        adc_stats: dict = {"enabled": adc_enabled}
+        if adc_enabled:
+            # DC offset
+            if bool(adc_cfg.get("dc_enabled", False)):
+                rx_samples, st = apply_dc_offset(
+                    rx_samples,
+                    dc_i=float(adc_cfg.get("dc_i", 0.0)),
+                    dc_q=float(adc_cfg.get("dc_q", 0.0)),
+                )
+                adc_stats["dc_offset"] = st
+            # IQ imbalance
+            if bool(adc_cfg.get("iq_imbalance_enabled", False)):
+                rx_samples, st = apply_iq_imbalance(
+                    rx_samples,
+                    amp_imbalance_db=float(adc_cfg.get("iq_amp_imbalance_db", 0.0)),
+                    phase_imbalance_deg=float(adc_cfg.get("iq_phase_imbalance_deg", 0.0)),
+                )
+                adc_stats["iq_imbalance"] = st
+            # AGC
+            if bool(adc_cfg.get("agc_enabled", True)):
+                rx_samples, st = agc_block(
+                    rx_samples,
+                    target_rms=float(adc_cfg.get("agc_target_rms", 1.0)),
+                    max_gain=float(adc_cfg.get("agc_max_gain", 100.0)),
+                    min_gain=float(adc_cfg.get("agc_min_gain", 0.01)),
+                )
+                adc_stats["agc"] = st
+            # Clipping
+            if bool(adc_cfg.get("clipping_enabled", True)):
+                rx_samples, st = clip_magnitude(
+                    rx_samples,
+                    clip_level=float(adc_cfg.get("clip_level", 1.2)),
+                )
+                adc_stats["clipping"] = st
+            # ADC quantization
+            if bool(adc_cfg.get("quantization_enabled", True)):
+                rx_samples, st = adc_quantize_iq(
+                    rx_samples,
+                    n_bits=int(adc_cfg.get("n_bits", 10)),
+                    full_scale=float(adc_cfg.get("full_scale", 1.0)),
+                )
+                adc_stats["quantization"] = st
+        else:
+            adc_stats = {"enabled": False}
+
+        rx_mf = matched_filter_rx(rx_samples, h_rrc=h_rrc)
+        # Timing recovery (optional). Default = old fixed downsample.
+        timing_cfg = wf_cfg.get("timing", {}) if isinstance(wf_cfg.get("timing", {}), dict) else {}
+        timing_enabled = bool(timing_cfg.get("enabled", False))
+        if timing_enabled:
+            tr_method = str(timing_cfg.get("method", "gardner")).lower().strip()
+            if tr_method != "gardner":
+                tr_method = "gardner"
+            init_off = float(timing_cfg.get("init_offset_samples", 0.0))
+            auto_init = bool(timing_cfg.get("auto_init", False))
+            auto_diag = None
+            if auto_init:
+                # Подбор по максимальному eye opening на первых N символах.
+                n_tr = int(timing_cfg.get("auto_traces", 200))
+                n_grid = int(timing_cfg.get("auto_grid", 33))
+                # Используем кусок rx_mf для скорости
+                max_len = int(timing_cfg.get("auto_rx_len", min(len(rx_mf), 20000)))
+                rx_mf_slice = rx_mf[:max_len]
+                init_off, auto_diag = auto_init_offset_by_eye_opening(
+                    rx_mf_slice,
+                    sps=sps,
+                    h_len=len(h_rrc),
+                    n_grid=n_grid,
+                    n_traces=n_tr,
+                    combine=str(timing_cfg.get("auto_combine", "IQ")),
+                )
+            rx_symbols_wf, timing_stats = gardner_timing_recovery(
+                rx_mf,
+                n_symbols=len(tx_symbols_wf),
+                sps=sps,
+                h_len=len(h_rrc),
+                alpha=float(timing_cfg.get("alpha", 0.01)),
+                beta=float(timing_cfg.get("beta", 0.0001)),
+                init_offset_samples=float(init_off),
+            )
+            timing_stats["auto_init"] = bool(auto_init)
+            if auto_init:
+                timing_stats["auto_init_diag"] = auto_diag
+                timing_stats["init_offset_used"] = float(init_off)
+        else:
+            rx_symbols_wf = downsample_to_symbols(
+                rx_mf, n_symbols=len(tx_symbols_wf), sps=sps, h_len=len(h_rrc)
+            )
+            timing_stats = {"timing_enabled": False}
+
+        channel_coeff = None
+
+        # CFO recovery: now supports estimation from training/pilots/preamble (data-aided) and blind fallback for PSK
+        cfo_est_cfg = wf_cfg.get("cfo", {}) if isinstance(wf_cfg.get("cfo", {}), dict) else {}
+        cfo_est_source = str(cfo_est_cfg.get("estimation_source", "preamble")).lower().strip()
+        if cfo_enabled and cfo_recovery_enabled and abs(cfo_norm) > 0.0:
+            # CFO estimate via repeated preamble if available; fallback to blind for PSK
+            omega = 0.0
+            phi0 = 0.0
+            tr_used = int(tr_len) if (tr_enabled and tx_training is not None) else 0
+            carrier_track = None
+
+            # 1) Prefer training/pilots if requested
+            if cfo_est_source in ("training", "training_ls") and tx_training is not None and rx_symbols_wf.size >= tr_used and tr_used >= 8:
+                omega0, phi00 = estimate_cfo_cpe_from_known_preamble(
+                    rx_symbols_wf[:tr_used],
+                    tx_training,
+                )
+                bw = max(float(ml_bw), 0.02 + 0.5 * abs(float(omega0)))
+                omega, phi0 = estimate_cfo_cpe_ml_from_known_preamble(
+                    rx_symbols_wf[:tr_used],
+                    tx_training,
+                    omega_coarse=float(omega0),
+                    search_bw=bw,
+                    n_grid=ml_grid,
+                )
+            elif cfo_est_source in ("pilots", "pilot") and pilots_enabled and tx_pilot is not None:
+                # use the first pilot block after training/preamble insertion
+                start_idx = tr_used
+                if pre_len_total:
+                    start_idx += pre_len_total
+                rx_p = rx_symbols_wf[start_idx:start_idx + pilot_len]
+                if rx_p.size >= min(8, pilot_len):
+                    omega0, phi00 = estimate_cfo_cpe_from_known_preamble(
+                        rx_p,
+                        tx_pilot[:rx_p.size],
+                    )
+                    bw = max(float(ml_bw), 0.02 + 0.5 * abs(float(omega0)))
+                    omega, phi0 = estimate_cfo_cpe_ml_from_known_preamble(
+                        rx_p,
+                        tx_pilot[:rx_p.size],
+                        omega_coarse=float(omega0),
+                        search_bw=bw,
+                        n_grid=ml_grid,
+                    )
+            elif cfo_est_source in ("pilots_track", "pilots_track_lin", "pilot_track", "track") and pilots_enabled and tx_pilot is not None and pilot_len > 0 and pilot_period > 0:
+                # Pilot-based tracking:
+                #  - estimate omega_k (CFO slope) per pilot
+                #  - estimate cpe_k (constant phase error) per pilot after removing slope
+                #  - apply correction either piecewise-constant or linear-interpolated between pilots
+                start0 = tr_used  # pilots are inserted after training
+                pilot_omegas: list[float] = []
+                pilot_cpes: list[float] = []
+                pilot_starts: list[int] = []
+
+                rx_corr = rx_symbols_wf.copy()
+                idx = start0
+                seg = 0
+                while idx + pilot_len <= rx_symbols_wf.size:
+                    rx_p = rx_symbols_wf[idx:idx + pilot_len]
+                    if rx_p.size < max(8, min(pilot_len, 16)):
+                        break
+                    omega_k, phi0_k = estimate_cfo_cpe_from_known_preamble(rx_p, tx_pilot[:rx_p.size])
+                    # Optional ML refinement around omega_k
+                    bw = max(float(ml_bw), 0.02 + 0.5 * abs(float(omega_k)))
+                    omega_k, phi0_k = estimate_cfo_cpe_ml_from_known_preamble(
+                        rx_p, tx_pilot[:rx_p.size],
+                        omega_coarse=float(omega_k),
+                        search_bw=bw,
+                        n_grid=ml_grid,
+                    )
+                    # CPE after removing slope from z[k]=r[k]*conj(s[k])
+                    z = rx_p * np.conj(tx_pilot[:rx_p.size])
+                    k_idx = np.arange(z.size, dtype=np.float64)
+                    z_derot = z * np.exp(-1j * float(omega_k) * k_idx)
+                    cpe_k = float(np.angle(np.mean(z_derot))) if z_derot.size else 0.0
+
+                    pilot_omegas.append(float(omega_k))
+                    pilot_cpes.append(float(cpe_k))
+                    pilot_starts.append(int(idx))
+
+                    # advance by [pilot][data]
+                    idx_data = idx + pilot_len
+                    data_len = min(int(pilot_period), int(rx_symbols_wf.size - idx_data))
+                    idx = idx_data + max(0, data_len)
+                    seg += 1
+
+                # Apply tracking correction
+                mode = "linear" if cfo_est_source in ("pilots_track_lin",) else "piecewise"
+                if pilot_starts:
+                    rx_corr = rx_symbols_wf.copy()
+                    for k in range(len(pilot_starts)):
+                        s0 = int(pilot_starts[k])
+                        s1 = int(pilot_starts[k + 1]) if (k + 1) < len(pilot_starts) else None
+                        w0 = float(pilot_omegas[k])
+                        c0 = float(pilot_cpes[k])
+                        if s1 is None:
+                            w1 = w0
+                            c1 = c0
+                            L = int(rx_corr.size - s0)
+                        else:
+                            w1 = float(pilot_omegas[k + 1])
+                            c1 = float(pilot_cpes[k + 1])
+                            L = int(s1 - s0)
+                        if L <= 0:
+                            continue
+
+                        # build omega/cpe over [s0 .. s0+L)
+                        n = np.arange(L, dtype=np.float64)
+                        if mode == "linear" and L > 1:
+                            tau = n / float(L - 1)
+                            omega_n = w0 + (w1 - w0) * tau
+                            cpe_n = c0 + (c1 - c0) * tau
+                        else:
+                            omega_n = np.full(L, w0, dtype=np.float64)
+                            cpe_n = np.full(L, c0, dtype=np.float64)
+
+                        phase_inc = np.cumsum(omega_n, dtype=np.float64)
+                        phase = cpe_n + (phase_inc - omega_n[0])
+                        rx_corr[s0:s0 + L] = rx_corr[s0:s0 + L] * np.exp(-1j * phase)
+
+                    rx_symbols_wf = rx_corr
+
+                # For reporting: take first pilot as global estimate (rough)
+                if pilot_omegas:
+                    omega = float(pilot_omegas[0])
+                    phi0 = float(pilot_cpes[0])
+                carrier_track = {
+                    "pilot_starts": pilot_starts,
+                    "omega_est_rad_per_sym": pilot_omegas,
+                    "cpe_est_rad": pilot_cpes,
+                    "pilot_len": int(pilot_len),
+                    "pilot_period": int(pilot_period),
+                    "mode": mode,
+                }
+            # 2) Legacy preamble-based (if available)
+            elif tx_preamble is not None and rx_symbols_wf.size >= (tr_used + pre_len_total):
+                # Data-aided: грубо CFO по повторению половин, затем уточняем ML-поиском.
+                omega0 = 0.0
+                if pre_half_len > 0:
+                    omega0 = estimate_cfo_from_repeated_preamble(
+                        rx_symbols_wf[tr_used:tr_used + pre_len_total],
+                        half_len=pre_half_len
+                    )
+                omega, phi0 = estimate_cfo_cpe_ml_from_known_preamble(
+                    rx_symbols_wf[tr_used:tr_used + pre_len_total],
+                    tx_preamble,
+                    omega_coarse=omega0,
+                    search_bw=ml_bw,
+                    n_grid=ml_grid,
+                )
+            elif pre_len_total >= 2 * pre_half_len and rx_symbols_wf.size >= (tr_used + 2 * pre_half_len):
+                # Blind (повторение): только CFO
+                omega = estimate_cfo_from_repeated_preamble(rx_symbols_wf[tr_used:], half_len=pre_half_len)
+                phi0 = 0.0
+            elif isinstance(mod, PSKModulator):
+                # Blind fallback for PSK
+                omega, phi0 = estimate_cfo_mth_power(rx_symbols_wf, m=mod.M)
+
+            # Компенсируем CFO + CPE
+            if cfo_est_source not in ("pilots_track", "pilot_track", "track"):
+                rx_symbols_wf = derotate_symbols(rx_symbols_wf, omega_rad_per_sym=omega, phi0_rad=phi0)
+            cfo_stats = {
+                "omega_est_rad_per_sym": float(omega),
+                "phi0_est_rad": float(phi0),
+                "estimation_source": cfo_est_source,
+            }
+            # true CFO if known from config (cfo_norm cycles/sample)
+            omega_true = 2.0 * np.pi * float(cfo_norm) * float(sps)
+            cfo_stats["omega_true_rad_per_sym"] = float(omega_true)
+            cfo_stats["omega_err_rad_per_sym"] = float(omega - omega_true)
+            if carrier_track is not None:
+                cfo_stats["carrier_track"] = carrier_track
+
+            # 3) Fine tracking loop — опционально (можно выключить alpha=beta=0)
+            if (pll_alpha > 0.0 or pll_beta > 0.0) and loop_type in ("dd", "dd_pll", "decision", "decision_directed"):
+                rx_symbols_wf, _ = carrier_recovery_dd_pll(
+                    rx_symbols_wf,
+                    constellation_points=mod.constellation_points,
+                    alpha=pll_alpha,
+                    beta=pll_beta,
+                )
+            elif (pll_alpha > 0.0 or pll_beta > 0.0) and loop_type in ("costas", "costas_mpsk"):
+                if isinstance(mod, PSKModulator):
+                    rx_symbols_wf, _ = carrier_recovery_costas_mpsk(
+                        rx_symbols_wf,
+                        m=mod.M,
+                        alpha=pll_alpha,
+                        beta=pll_beta,
+                    )
+                else:
+                    # Для QAM Costas_mpsk не применим; fallback на DD-PLL
+                    rx_symbols_wf, _ = carrier_recovery_dd_pll(
+                        rx_symbols_wf,
+                        constellation_points=mod.constellation_points,
+                        alpha=pll_alpha,
+                        beta=pll_beta,
+                    )
+        else:
+            cfo_stats = {"omega_est_rad_per_sym": 0.0, "phi0_est_rad": 0.0, "estimation_source": cfo_est_source}
+
+        # ── Equalizer (по training / пилотам / идеальный) ────────────────────
+        eq_cfg = wf_cfg.get("equalizer", {}) if isinstance(wf_cfg.get("equalizer", {}), dict) else {}
+        eq_enabled = bool(eq_cfg.get("enabled", False))
+        eq_kind = str(eq_cfg.get("kind", "mmse")).lower().strip()
+        if eq_enabled:
+            eq_len = int(eq_cfg.get("eq_len", 9))
+            eq_delay = eq_cfg.get("delay", None)
+            eq_delay = int(eq_delay) if eq_delay is not None else None
+            est_method = str(eq_cfg.get("estimation", "ideal")).lower().strip()
+            chan_taps = int(eq_cfg.get("channel_taps", 32))
+            # noise variance on complex symbol after MF sampling: N0 = 1/snr_lin
+            noise_var = float(1.0 / max(snr_lin, 1e-30))
+            ls_reg = float(eq_cfg.get("ls_reg", 1e-3))
+
+            # Индексы разметки кадра в rx_symbols_wf:
+            # [training][cfo_preamble+data_with_optional_pilots]
+            tr_used = int(tr_len) if (tr_enabled and tx_training is not None) else 0
+
+            def _design_from_h(h_est: np.ndarray) -> tuple[np.ndarray, int]:
+                w, d = design_linear_equalizer(
+                    h_est,
+                    eq_len=eq_len,
+                    delay=eq_delay,
+                    kind=eq_kind,
+                    noise_var=noise_var,
+                )
+                return w, d
+
+            if est_method in ("training_ls", "training"):
+                if tr_used > 0:
+                    rx_tr = rx_symbols_wf[:tr_used]
+                    h_sym = estimate_channel_ls(
+                        tx_training,
+                        rx_tr,
+                        channel_len=chan_taps,
+                        reg=ls_reg,
+                    )
+                    w_eq, d_used = _design_from_h(h_sym)
+                else:
+                    h_sym = estimate_symbol_spaced_channel(
+                        h_rrc=h_rrc, sps=sps, h_tdl=h_tdl if tdl_enabled else None, n_symbols=chan_taps
+                    )
+                    w_eq, d_used = _design_from_h(h_sym)
+            elif est_method in ("pilot_ls", "pilots"):
+                # коэффициенты будут обновляться кусочно на данных по пилотам
+                w_eq, d_used = _design_from_h(
+                    estimate_symbol_spaced_channel(
+                        h_rrc=h_rrc, sps=sps, h_tdl=h_tdl if tdl_enabled else None, n_symbols=chan_taps
+                    )
+                )
+            elif est_method in ("preamble", "preamble_ls", "ls"):
+                # legacy: оценка по CFO-переамбуле (если включена)
+                if pre_len_total and tx_preamble is not None:
+                    rx_pre = rx_symbols_wf[tr_used:tr_used + pre_len_total]
+                    h_sym = estimate_channel_ls(tx_preamble, rx_pre, channel_len=chan_taps, reg=ls_reg)
+                    w_eq, d_used = _design_from_h(h_sym)
+                else:
+                    h_sym = estimate_symbol_spaced_channel(
+                        h_rrc=h_rrc, sps=sps, h_tdl=h_tdl if tdl_enabled else None, n_symbols=chan_taps
+                    )
+                    w_eq, d_used = _design_from_h(h_sym)
+            else:
+                # "ideal"
+                h_sym = estimate_symbol_spaced_channel(
+                    h_rrc=h_rrc,
+                    sps=sps,
+                    h_tdl=h_tdl if tdl_enabled else None,
+                    n_symbols=chan_taps,
+                )
+                w_eq, d_used = _design_from_h(h_sym)
+
+        # ── Снять training + CFO-преамбулу, затем убрать пилоты ───────────────
+        tr_used = int(tr_len) if (tr_enabled and tx_training is not None) else 0
+        start_data = tr_used + (pre_len_total if pre_len_total else 0)
+        rx_stream = rx_symbols_wf[start_data:]
+        tx_stream = tx_symbols_wf_full[start_data:]
+
+        # Эквализация: либо одним блоком, либо с обновлением по пилотам
+        # Также собираем потоки “до EQ / после EQ” для EVM/созвездия.
+        rx_before_eq_stream = rx_stream
+        if eq_enabled and est_method in ("pilot_ls", "pilots") and pilots_enabled and tx_pilot is not None:
+            # структура: [pilot][data_chunk][pilot][data_chunk]...
+            out_chunks = []
+            tx_chunks = []
+            idx = 0
+            # для непрерывности FIR между чанками данных используем overlap на входе
+            # overlap_len = (Lw-1) + delay
+            in_hist = np.array([], dtype=complex)
+            while idx < rx_stream.size:
+                # pilot
+                rx_p = rx_stream[idx:idx + pilot_len]
+                tx_p = tx_stream[idx:idx + pilot_len]
+                if rx_p.size < pilot_len:
+                    break
+                h_hat = estimate_channel_ls(tx_pilot, rx_p, channel_len=chan_taps, reg=ls_reg)
+                w_eq, d_used = design_linear_equalizer(
+                    h_hat, eq_len=eq_len, delay=eq_delay, kind=eq_kind, noise_var=noise_var
+                )
+                idx += pilot_len
+                # data until next pilot (pilot_period) or remainder
+                rx_d = rx_stream[idx:idx + pilot_period]
+                tx_d = tx_stream[idx:idx + pilot_period]
+
+                overlap_len = max(0, (len(w_eq) - 1) + int(d_used))
+                if overlap_len > 0:
+                    # держим немного истории входа, чтобы фильтр не “обнулялся” между блоками
+                    if in_hist.size > overlap_len:
+                        in_hist = in_hist[-overlap_len:]
+                    x_blk = np.concatenate([in_hist, rx_d])
+                    y_blk = equalize_symbols(x_blk, w_eq, delay=d_used)
+                    rx_d_eq = y_blk[in_hist.size:]
+                    # обновить историю входа (на границе блоков)
+                    in_hist = x_blk[-overlap_len:]
+                else:
+                    rx_d_eq = equalize_symbols(rx_d, w_eq, delay=d_used)
+
+                out_chunks.append(rx_d_eq)
+                tx_chunks.append(tx_d)
+                idx += rx_d.size
+            rx_symbols = np.concatenate(out_chunks) if out_chunks else np.array([], dtype=complex)
+            tx_symbols_ref = np.concatenate(tx_chunks) if tx_chunks else np.array([], dtype=complex)
+        else:
+            rx_symbols = equalize_symbols(rx_stream, w_eq, delay=d_used) if eq_enabled else rx_stream
+            tx_symbols_ref = tx_stream.copy()
+
+        # Удаляем пилоты из потока (если пилоты включены, но эквализация не делала удаление)
+        if pilots_enabled and tx_pilot is not None:
+            chunks = []
+            tx_chunks = []
+            i = 0
+            while i < rx_symbols.size:
+                # skip pilot
+                i += pilot_len
+                if i >= rx_symbols.size:
+                    break
+                chunks.append(rx_symbols[i:i + pilot_period])
+                tx_chunks.append(tx_symbols_ref[i:i + pilot_period])
+                i += pilot_period
+            rx_symbols = np.concatenate(chunks) if chunks else np.array([], dtype=complex)
+            tx_symbols_ref = np.concatenate(tx_chunks) if tx_chunks else np.array([], dtype=complex)
+
+        # ── EVM + созвездие до/после EQ ──────────────────────────────────────
+        evm_before = None
+        evm_after = None
+        const_before = None
+        const_after = None
+        eye_before = None
+        eye_after = None
+        eye_metrics = None
+        evm_over_time = None
+        if tx_symbols_ref.size and rx_symbols.size:
+            plots_cfg = wf_cfg.get("plots", {}) if isinstance(wf_cfg.get("plots", {}), dict) else {}
+            n = int(min(tx_symbols_ref.size, rx_symbols.size))
+            txr = tx_symbols_ref[:n]
+            rxa = rx_symbols[:n]
+            # “до EQ”: если EQ выключен, то совпадает с rxa; иначе берём rx_stream без EQ, но уже без training/preamble/pilots
+            # Для простоты и корректности по длине используем rx_before_eq_stream, затем вырезаем как и tx_symbols_ref.
+            if eq_enabled:
+                rx0 = rx_before_eq_stream.copy()
+                # удалить пилоты из rx0 по той же схеме
+                if pilots_enabled and tx_pilot is not None:
+                    rx0_chunks = []
+                    j = 0
+                    while j < rx0.size:
+                        j += pilot_len
+                        if j >= rx0.size:
+                            break
+                        rx0_chunks.append(rx0[j:j + pilot_period])
+                        j += pilot_period
+                    rx0 = np.concatenate(rx0_chunks) if rx0_chunks else np.array([], dtype=complex)
+                rx0 = rx0[:n] if rx0.size >= n else np.pad(rx0, (0, n - rx0.size))
+            else:
+                rx0 = rxa
+
+            # RMS EVM, нормировано на мощность TX
+            p = float(np.mean(np.abs(txr) ** 2)) if txr.size else 1.0
+            p = p if p > 1e-30 else 1.0
+            evm_before = float(np.sqrt(np.mean(np.abs(rx0 - txr) ** 2) / p))
+            evm_after = float(np.sqrt(np.mean(np.abs(rxa - txr) ** 2) / p))
+
+            # EVM over time (chunked)
+            chunk = int(plots_cfg.get("evm_chunk_symbols", 256))
+            chunk = max(32, min(8192, chunk))
+            evm_list = []
+            for i0 in range(0, n, chunk):
+                i1 = min(n, i0 + chunk)
+                if i1 - i0 < 8:
+                    break
+                txc = txr[i0:i1]
+                rxc = rxa[i0:i1]
+                pc = float(np.mean(np.abs(txc) ** 2))
+                pc = pc if pc > 1e-30 else 1.0
+                evm_c = float(np.sqrt(np.mean(np.abs(rxc - txc) ** 2) / pc))
+                evm_list.append({"start": int(i0), "len": int(i1 - i0), "evm_rms": evm_c})
+            evm_over_time = evm_list if evm_list else None
+            if bool(plots_cfg.get("constellation", True)) and (eq_enabled or bool(plots_cfg.get("constellation_always", False))):
+                n_pts = int(plots_cfg.get("constellation_points", 2000))
+                n_pts = max(100, min(20000, n_pts))
+                sel = slice(0, min(n_pts, n))
+                const_before = np.column_stack([rx0[sel].real, rx0[sel].imag]).tolist()
+                const_after = np.column_stack([rxa[sel].real, rxa[sel].imag]).tolist()
+
+            # Eye diagram (до/после timing recovery)
+            if bool(plots_cfg.get("eye_diagram", False)):
+                n_tr = int(plots_cfg.get("eye_traces", 200))
+                n_tr = max(20, min(2000, n_tr))
+                # До: просто фиксированная сетка по sps вокруг идеального start (2*gd)
+                gd = (len(h_rrc) - 1) // 2
+                start = 2 * gd
+                win = 2 * int(sps)
+                traces_i = []
+                traces_q = []
+                for k in range(min(n_tr, max(0, (len(rx_mf) - start) // int(sps) - 2))):
+                    i0 = start + k * int(sps) - int(sps)
+                    if i0 < 0:
+                        continue
+                    seg = rx_mf[i0:i0 + win]
+                    if seg.size != win:
+                        break
+                    traces_i.append(seg.real.astype(float).tolist())
+                    traces_q.append(seg.imag.astype(float).tolist())
+                eye_before = {"I": traces_i, "Q": traces_q} if traces_i else None
+
+                # После: используем t_hist из Gardner, если timing включен
+                if timing_stats.get("timing_enabled", False) and isinstance(timing_stats.get("t_hist"), np.ndarray):
+                    t_hist = timing_stats["t_hist"]
+                    traces2_i = []
+                    traces2_q = []
+                    for k in range(min(n_tr, int(t_hist.size))):
+                        tk = float(t_hist[k])
+                        # окно 2 символа вокруг tk: [-sps .. +sps)
+                        ts = tk - float(sps) + np.arange(win, dtype=np.float64)
+                        seg = np.array([interp_lagrange4(rx_mf, float(tt)) for tt in ts], dtype=complex)
+                        traces2_i.append(seg.real.astype(float).tolist())
+                        traces2_q.append(seg.imag.astype(float).tolist())
+                    eye_after = {"I": traces2_i, "Q": traces2_q} if traces2_i else None
+
+                # Eye opening metric (heuristic): сравнить std в центре глаза и в середине символа
+                # Чем больше (std_mid - std_center), тем "открытее" глаз.
+                center_idx = int(sps)  # центр окна (2*sps) для основного решения
+                mid_idx = int(sps // 2)
+                def _eye_stats(eye_dict, comp_key: str):
+                    if not eye_dict or comp_key not in eye_dict:
+                        return None
+                    tr = eye_dict[comp_key]
+                    if not tr:
+                        return None
+                    arr = np.asarray(tr, dtype=float)
+                    if arr.ndim != 2 or arr.shape[1] <= center_idx:
+                        return None
+                    c = arr[:, center_idx]
+                    m = arr[:, mid_idx] if arr.shape[1] > mid_idx else c
+                    std_c = float(np.std(c))
+                    std_m = float(np.std(m))
+                    opening = float(std_m - std_c)
+                    opening_norm = float(opening / (std_m + 1e-12))
+                    return {"std_center": std_c, "std_mid": std_m, "opening": opening, "opening_norm": opening_norm}
+
+                eye_metrics = {
+                    "I": {
+                        "before": _eye_stats(eye_before, "I"),
+                        "after":  _eye_stats(eye_after, "I"),
+                    },
+                    "Q": {
+                        "before": _eye_stats(eye_before, "Q"),
+                        "after":  _eye_stats(eye_after, "Q"),
+                    },
+                    "center_idx": center_idx,
+                    "mid_idx": mid_idx,
+                    "window_len": win,
+                }
+
+        rx_bits = mod.demodulate(rx_symbols, channel_coeff)
+        channel_names = ["AWGN", "RRC(sps)"]
+        if timing_stats.get("timing_enabled", False):
+            channel_names.append("Timing(Gardner)")
+        if tdl_enabled:
+            channel_names.append("TDL")
+        if eq_enabled:
+            channel_names.append(f"EQ({eq_kind.upper()})")
+            if est_method in ("training_ls", "training"):
+                channel_names.append("CH_EST(training_ls)")
+            elif est_method in ("pilot_ls", "pilots"):
+                channel_names.append("CH_EST(pilot_ls)")
+            elif est_method in ("preamble", "preamble_ls", "ls"):
+                channel_names.append("CH_EST(preamble_ls)")
+        channel_names += (["CFO"] if (cfo_enabled and abs(cfo_norm) > 0.0) else [])
+        if cfo_enabled and cfo_recovery_enabled and abs(cfo_norm) > 0.0:
+            channel_names.append("CFO_recovery")
+        if pre_len_total:
+            channel_names.append("CFO_preamble")
+        if tr_used:
+            channel_names.append("TRAINING")
+        if pilots_enabled and tx_pilot is not None:
+            channel_names.append("PILOTS")
+
+        """
+
+    else:
+        # Старый symbol-rate режим: комплексный символ = 1 отсчёт
+        rx_symbols, channel_coeff = channel.apply_with_coeff(tx_symbols, snr_lin)
+        rx_bits = mod.demodulate(rx_symbols, channel_coeff)
+        channel_names = channel.get_channel_names()
 
     # ── Деинтерливинг (RX) ──────────────────────────────────────────────────
     if interleaver is not None:
@@ -449,7 +1237,7 @@ def _run_pipeline(
     early_stop = bool(ber < early_stop_ber and early_stop_ber > 0)
 
     esn0_dB       = 10.0 * np.log10(snr_lin) if snr_lin > 0 else float("-inf")
-    channel_names = channel.get_channel_names()
+    # channel_names определили выше (waveform или symbol-rate)
 
     # Для отображения в логе adaptive_scale считаем по base_bits если доступен
     base_bits = config.get("random_settings", {}).get("num_bits", min_len)
@@ -489,6 +1277,8 @@ def _run_pipeline(
         "snr":                      ebn0_dB,
         "ber":                      float(ber),
         "ber_pre_decrypt":          float(ber_pre_decrypt),
+        "bit_errors":               int(bit_errors),
+        "bit_errors_pre_decrypt":   int(bit_errors_pre),
         "ser":                      float(ser),
         "per":                      float(per),
         "per_packet_errors":        per_err,
@@ -518,6 +1308,18 @@ def _run_pipeline(
         "error_propagation_factor": enc_stats["error_propagation_factor"],
         # decoded_bits для text-режима (дешифрованные)
         "decoded_bits":             decrypted_bits,
+        # Waveform metrics (optional)
+        "evm_rms_before_eq":        float(evm_before) if evm_before is not None else None,
+        "evm_rms_after_eq":         float(evm_after) if evm_after is not None else None,
+        "constellation_before_eq":  const_before,
+        "constellation_after_eq":   const_after,
+        "timing_stats":             timing_stats,
+        "eye_before":               eye_before,
+        "eye_after":                eye_after,
+        "eye_metrics":              eye_metrics,
+        "cfo_stats":                cfo_stats,
+        "evm_over_time":            evm_over_time,
+        "adc_stats":                adc_stats,
     }
 
 
@@ -540,6 +1342,7 @@ def simulate_transmission(config: dict,
         dict: snr, ber, ser, per, theoretical_ber, theoretical_ser,
               rayleigh_theoretical_ber, coding_gain_dB, early_stop, и т.д.
     """
+    config = normalize_config(config)
     base_bits = config["random_settings"]["num_bits"]
     num_bits  = _adaptive_num_bits(
         base_bits, prev_ber,
@@ -566,6 +1369,7 @@ def simulate_text_transmission(config: dict,
     Вычисляет PER если включено в config["per_settings"].
     Возвращает rayleigh_theoretical_ber.
     """
+    config = normalize_config(config)
     if log_config_once:
         _log_config(config, "text", text_len=len(text))
 
@@ -723,6 +1527,7 @@ def plot_and_save_results(config: dict,
       1. BER/SER (всегда) — с аннотацией coding_gain
       2. PER (если есть данные)
       3. CER (только text-режим)
+      4. EVM (если доступно evm_rms_* в results)
     """
     if not results:
         return None, None
@@ -765,8 +1570,12 @@ def plot_and_save_results(config: dict,
         ax.set_title(title, fontsize=12, fontweight="bold", pad=15)
         ax.legend(fontsize=9, framealpha=0.9)
 
+    evm_before = np.array([r.get("evm_rms_before_eq") for r in results], dtype=object)
+    evm_after  = np.array([r.get("evm_rms_after_eq")  for r in results], dtype=object)
+    has_evm = any(v is not None for v in evm_before) or any(v is not None for v in evm_after)
+
     # Определяем число subplot-ов
-    n_plots = 1 + int(has_per) + int(mode == "text")
+    n_plots = 1 + int(has_per) + int(mode == "text") + int(has_evm)
     if n_plots == 1:
         fig, ax1 = plt.subplots(figsize=(10, 6))
         axes = [ax1]
@@ -838,10 +1647,157 @@ def plot_and_save_results(config: dict,
         ax_cer.set_ylim(-2, 105)
         _style_ax(ax_cer, "Качество восстановления текста", "Правильных символов (%)")
 
+    # ── EVM ──────────────────────────────────────────────────────────────────
+    if has_evm:
+        ax_evm = axes[ax_idx]
+        # Переведём в float и проставим nan где None
+        def _to_float_nan(arr_obj):
+            out = np.full(len(arr_obj), np.nan, dtype=float)
+            for i, v in enumerate(arr_obj):
+                if v is None:
+                    continue
+                try:
+                    out[i] = float(v)
+                except Exception:
+                    out[i] = np.nan
+            return out
+        evm_b = _to_float_nan(evm_before)
+        evm_a = _to_float_nan(evm_after)
+        if np.any(np.isfinite(evm_b)):
+            ax_evm.plot(snr, evm_b, "o-", color=YELLOW, lw=2.5, ms=6,
+                        label="EVM до EQ", markerfacecolor=YELLOW, markeredgewidth=1.5, markeredgecolor="white")
+        if np.any(np.isfinite(evm_a)):
+            ax_evm.plot(snr, evm_a, "s--", color=GREEN, lw=2.5, ms=6,
+                        label="EVM после EQ", markerfacecolor=GREEN, markeredgewidth=1.5, markeredgecolor="white")
+        ax_evm.set_ylim(0, max(0.5, float(np.nanmax(np.concatenate([evm_b, evm_a])) * 1.1) if np.any(np.isfinite(evm_a)) or np.any(np.isfinite(evm_b)) else 0.5))
+        _style_ax(ax_evm, "EVM (RMS)", "EVM (норм.)")
+
     fig.patch.set_facecolor(BG)
     fig.tight_layout()
     fig.savefig(plot_filename, dpi=150, facecolor=BG)
     logger.info(f"График сохранён: {plot_filename}")
+
+    # ── Созвездие до/после EQ (отдельный PNG) ────────────────────────────────
+    try:
+        last = results[-1] if results else {}
+        cb = last.get("constellation_before_eq")
+        ca = last.get("constellation_after_eq")
+        if cb and ca and isinstance(cb, list) and isinstance(ca, list):
+            cb_arr = np.asarray(cb, dtype=float)
+            ca_arr = np.asarray(ca, dtype=float)
+            if cb_arr.ndim == 2 and cb_arr.shape[1] == 2 and ca_arr.ndim == 2 and ca_arr.shape[1] == 2:
+                const_filename = str(Path(output_dir) / f"ConstellationEQ_{mod_type}{order}_{mode_abbr}_{timestamp}.png")
+                fig2, (ax_b, ax_a) = plt.subplots(1, 2, figsize=(10, 5))
+                fig2.patch.set_facecolor(BG)
+                for ax, data, title, color in [
+                    (ax_b, cb_arr, "До EQ", CYAN),
+                    (ax_a, ca_arr, "После EQ", GREEN),
+                ]:
+                    ax.set_facecolor(BG)
+                    ax.scatter(data[:, 0], data[:, 1], s=6, c=color, alpha=0.6, edgecolors="none")
+                    ax.grid(True, alpha=0.25, linestyle="--")
+                    ax.set_aspect("equal", adjustable="box")
+                    ax.set_xlabel("I", fontsize=11, fontweight="bold")
+                    ax.set_ylabel("Q", fontsize=11, fontweight="bold")
+                    ax.set_title(title, fontsize=12, fontweight="bold", pad=12)
+                fig2.suptitle("Созвездие (последняя точка SNR)", fontsize=13, fontweight="bold", color=TEXT_LIGHT if 'TEXT_LIGHT' in globals() else "white")
+                fig2.tight_layout()
+                fig2.savefig(const_filename, dpi=150, facecolor=BG)
+                plt.close(fig2)
+                logger.info(f"Созвездие до/после EQ сохранено: {const_filename}")
+    except Exception as e:
+        logger.warning(f"Не удалось сохранить созвездие до/после EQ: {e}")
+
+    # ── Eye diagram до/после timing recovery (отдельный PNG) ─────────────────
+    try:
+        last = results[-1] if results else {}
+        eb = last.get("eye_before")
+        ea = last.get("eye_after")
+        if eb and isinstance(eb, dict) and "I" in eb and "Q" in eb:
+            eye_filename = str(Path(output_dir) / f"Eye_{mod_type}{order}_{mode_abbr}_{timestamp}.png")
+            fig3, axarr = plt.subplots(2, 2, figsize=(12, 8))
+            fig3.patch.set_facecolor(BG)
+
+            def _plot_eye(ax, traces, title, color):
+                ax.set_facecolor(BG)
+                for tr in traces:
+                    arr = np.asarray(tr, dtype=float)
+                    ax.plot(arr, color=color, alpha=0.08, lw=1.0)
+                ax.grid(True, alpha=0.25, linestyle="--")
+                ax.set_title(title, fontsize=12, fontweight="bold", pad=12)
+                ax.set_xlabel("Отсчёты", fontsize=11, fontweight="bold")
+                ax.set_ylabel("Амплитуда", fontsize=11, fontweight="bold")
+
+            ax_I_b = axarr[0, 0]
+            ax_I_a = axarr[0, 1]
+            ax_Q_b = axarr[1, 0]
+            ax_Q_a = axarr[1, 1]
+
+            _plot_eye(ax_I_b, eb.get("I", []), "Eye I: до timing recovery", CYAN)
+            _plot_eye(ax_Q_b, eb.get("Q", []), "Eye Q: до timing recovery", PINK)
+
+            if ea and isinstance(ea, dict):
+                _plot_eye(ax_I_a, ea.get("I", []), "Eye I: после timing recovery", GREEN)
+                _plot_eye(ax_Q_a, ea.get("Q", []), "Eye Q: после timing recovery", YELLOW)
+            else:
+                ax_I_a.axis("off")
+                ax_Q_a.axis("off")
+
+            fig3.tight_layout()
+            fig3.savefig(eye_filename, dpi=150, facecolor=BG)
+            plt.close(fig3)
+            logger.info(f"Eye diagram сохранён: {eye_filename}")
+    except Exception as e:
+        logger.warning(f"Не удалось сохранить eye diagram: {e}")
+
+    # ── Carrier tracking plot (omega/phi vs time + EVM over time) ────────────
+    try:
+        last = results[-1] if results else {}
+        cs = last.get("cfo_stats") or {}
+        tr = cs.get("carrier_track") if isinstance(cs, dict) else None
+        evm_ot = last.get("evm_over_time")
+        if tr and isinstance(tr, dict) and tr.get("pilot_starts") and (evm_ot is not None):
+            tr_filename = str(Path(output_dir) / f"CarrierTrack_{mod_type}{order}_{mode_abbr}_{timestamp}.png")
+            fig4, axarr = plt.subplots(3, 1, figsize=(11, 9), sharex=False)
+            fig4.patch.set_facecolor(BG)
+
+            pstarts = np.asarray(tr.get("pilot_starts", []), dtype=float)
+            omegas = np.asarray(tr.get("omega_est_rad_per_sym", []), dtype=float)
+            cpes = np.asarray(tr.get("cpe_est_rad", []), dtype=float)
+
+            ax_w = axarr[0]
+            ax_p = axarr[1]
+            ax_e = axarr[2]
+            for ax in axarr:
+                ax.set_facecolor(BG)
+                ax.grid(True, alpha=0.25, linestyle="--")
+
+            if pstarts.size and omegas.size:
+                ax_w.plot(np.arange(len(omegas)), omegas, "o-", color=CYAN, lw=2.2, ms=5, label="omega est (rad/sym)")
+                if "omega_true_rad_per_sym" in cs:
+                    ax_w.axhline(float(cs["omega_true_rad_per_sym"]), color=YELLOW, ls="--", lw=1.6, alpha=0.7, label="omega true")
+                ax_w.set_ylabel("ω (rad/sym)", fontweight="bold")
+                ax_w.legend(fontsize=9, framealpha=0.9)
+
+            if pstarts.size and cpes.size:
+                ax_p.plot(np.arange(len(cpes)), np.unwrap(cpes), "o-", color=GREEN, lw=2.2, ms=5, label="CPE est (rad)")
+                ax_p.set_ylabel("CPE φ (rad)", fontweight="bold")
+                ax_p.legend(fontsize=9, framealpha=0.9)
+
+            if isinstance(evm_ot, list) and evm_ot:
+                xs = [d.get("start", 0) for d in evm_ot]
+                ys = [d.get("evm_rms", np.nan) for d in evm_ot]
+                ax_e.plot(xs, ys, "s-", color=PINK, lw=2.2, ms=5, label="EVM RMS (chunk)")
+                ax_e.set_xlabel("Symbol index", fontweight="bold")
+                ax_e.set_ylabel("EVM", fontweight="bold")
+                ax_e.legend(fontsize=9, framealpha=0.9)
+
+            fig4.tight_layout()
+            fig4.savefig(tr_filename, dpi=150, facecolor=BG)
+            plt.close(fig4)
+            logger.info(f"Carrier tracking plot сохранён: {tr_filename}")
+    except Exception as e:
+        logger.warning(f"Не удалось сохранить carrier tracking plot: {e}")
     return plot_filename, fig
 
 

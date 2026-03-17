@@ -55,13 +55,10 @@ import queue
 import threading
 import time
 from datetime import datetime
-from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 import numpy as np
-import os
-print("Текущая рабочая директория:", os.getcwd())
 
 from simulation import (
     simulate_transmission,
@@ -69,8 +66,8 @@ from simulation import (
     save_results_to_text,
     plot_and_save_results,
     plot_comparison,
-    results_manager,
 )
+from simulation_runner import results_manager
 from results_manager import _to_python  # для JSON-экспорта
 
 # ── Цветовая схема ────────────────────────────────────────────────────────────
@@ -85,6 +82,77 @@ TEXT_LIGHT    = "#ffffff"
 
 
 # ── Вспомогательные функции GUI ───────────────────────────────────────────────
+
+class ToolTip:
+    """Простые подсказки при наведении (без внешних зависимостей)."""
+
+    def __init__(self, widget: tk.Widget, text: str, *, delay_ms: int = 550) -> None:
+        self.widget = widget
+        self.text = text
+        self.delay_ms = delay_ms
+        self._after_id: str | None = None
+        self._tip: tk.Toplevel | None = None
+
+        widget.bind("<Enter>", self._on_enter, add=True)
+        widget.bind("<Leave>", self._on_leave, add=True)
+        widget.bind("<ButtonPress>", self._on_leave, add=True)
+
+    def _on_enter(self, _: object) -> None:
+        if not self.text:
+            return
+        self._cancel()
+        self._after_id = self.widget.after(self.delay_ms, self._show)
+
+    def _on_leave(self, _: object) -> None:
+        self._cancel()
+        self._hide()
+
+    def _cancel(self) -> None:
+        if self._after_id:
+            try:
+                self.widget.after_cancel(self._after_id)
+            except Exception:
+                pass
+            self._after_id = None
+
+    def _show(self) -> None:
+        if self._tip or not self.widget.winfo_exists():
+            return
+        x = self.widget.winfo_rootx() + 18
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 10
+
+        tip = tk.Toplevel(self.widget)
+        tip.wm_overrideredirect(True)
+        tip.wm_attributes("-topmost", True)
+        tip.configure(bg="#0b1220")
+
+        label = tk.Label(
+            tip,
+            text=self.text,
+            justify=tk.LEFT,
+            bg="#0b1220",
+            fg=TEXT_LIGHT,
+            padx=10,
+            pady=6,
+            font=("Segoe UI", 9),
+            wraplength=380,
+        )
+        label.pack()
+
+        try:
+            tip.wm_geometry(f"+{x}+{y}")
+        except Exception:
+            pass
+        self._tip = tip
+
+    def _hide(self) -> None:
+        if self._tip:
+            try:
+                self._tip.destroy()
+            except Exception:
+                pass
+            self._tip = None
+
 
 def make_scrollable(tab: "ttk.Frame") -> "ttk.Frame":
     """
@@ -112,10 +180,18 @@ def make_scrollable(tab: "ttk.Frame") -> "ttk.Frame":
     def _on_mousewheel_linux(e):
         canvas.yview_scroll(-1 if e.num == 4 else 1, "units")
 
-    canvas.bind("<Enter>", lambda _: canvas.bind_all("<MouseWheel>", _on_mousewheel))
-    canvas.bind("<Leave>", lambda _: canvas.unbind_all("<MouseWheel>"))
-    canvas.bind("<Enter>", lambda _: canvas.bind_all("<Button-4>", _on_mousewheel_linux), add="+")
-    canvas.bind("<Enter>", lambda _: canvas.bind_all("<Button-5>", _on_mousewheel_linux), add="+")
+    def _on_enter(_: object) -> None:
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        canvas.bind_all("<Button-4>", _on_mousewheel_linux)
+        canvas.bind_all("<Button-5>", _on_mousewheel_linux)
+
+    def _on_leave(_: object) -> None:
+        canvas.unbind_all("<MouseWheel>")
+        canvas.unbind_all("<Button-4>")
+        canvas.unbind_all("<Button-5>")
+
+    canvas.bind("<Enter>", _on_enter)
+    canvas.bind("<Leave>", _on_leave)
     return inner
 
 
@@ -193,6 +269,7 @@ class SimulationGUI:
         self.root = root
         self.root.title("Симулятор цифровой связи — M-PSK / M-QAM")
         self.root.geometry("1400x900")
+        self.root.minsize(1100, 720)
         self.root.configure(bg=DARK_BG)
         try:
             self.root.iconbitmap(default="icon.ico")
@@ -202,6 +279,7 @@ class SimulationGUI:
         self._setup_style()
 
         # --- Переменные состояния ---
+        self.profile_var          = tk.StringVar(value="balanced")
         self.mode_var             = tk.StringVar(value="random")
         self.num_bits_var         = tk.StringVar(value="100000")
         self.num_simulations_var  = tk.StringVar(value="5")
@@ -252,6 +330,83 @@ class SimulationGUI:
         self.tr_enabled_var   = tk.BooleanVar(value=False)
         self.tr_window_var    = tk.StringVar(value="3")
 
+        # Waveform (sps/RRC/CFO) — дискретно-временной режим
+        self.wf_enabled_var     = tk.BooleanVar(value=False)
+        self.wf_sps_var         = tk.StringVar(value="8")
+        self.wf_rrc_beta_var    = tk.StringVar(value="0.35")
+        self.wf_rrc_span_var    = tk.StringVar(value="10")
+        self.wf_cfo_enabled_var = tk.BooleanVar(value=False)
+        self.wf_cfo_norm_var    = tk.StringVar(value="0.0")
+        self.wf_cfo_rec_var     = tk.BooleanVar(value=True)
+        self.wf_pll_mode_var    = tk.StringVar(value="medium")
+        self.wf_cfo_preamble_var = tk.BooleanVar(value=True)
+        self.wf_cfo_prelen_var   = tk.StringVar(value="64")
+        self.wf_cfo_loop_var     = tk.StringVar(value="dd_pll")
+        self.wf_cfo_src_var      = tk.StringVar(value="preamble")
+        # Waveform: TDL multipath + equalizer (symbol-rate)
+        self.wf_tdl_enabled_var  = tk.BooleanVar(value=False)
+        self.wf_tdl_delays_var   = tk.StringVar(value="0, 1, 3")
+        self.wf_tdl_powers_var   = tk.StringVar(value="0, -3, -6")
+        self.wf_tdl_seed_var     = tk.StringVar(value="123")
+        self.wf_tdl_frac_taps_var = tk.StringVar(value="21")
+        self.wf_eq_enabled_var   = tk.BooleanVar(value=False)
+        self.wf_eq_kind_var      = tk.StringVar(value="mmse")
+        self.wf_eq_len_var       = tk.StringVar(value="9")
+        self.wf_eq_delay_var     = tk.StringVar(value="")
+        self.wf_eq_chan_taps_var = tk.StringVar(value="32")
+        self.wf_eq_est_var       = tk.StringVar(value="ideal")
+        self.wf_eq_ls_reg_var    = tk.StringVar(value="1e-3")
+        # Training + pilots for channel estimation (symbol-rate)
+        self.wf_tr_enabled_var   = tk.BooleanVar(value=False)
+        self.wf_tr_len_var       = tk.StringVar(value="128")
+        self.wf_tr_seed_var      = tk.StringVar(value="12345")
+        self.wf_pil_enabled_var  = tk.BooleanVar(value=False)
+        self.wf_pil_period_var   = tk.StringVar(value="256")
+        self.wf_pil_len_var      = tk.StringVar(value="16")
+        self.wf_pil_seed_var     = tk.StringVar(value="4242")
+        # Plots/metrics for waveform
+        self.wf_plot_const_var   = tk.BooleanVar(value=True)
+        self.wf_const_points_var = tk.StringVar(value="2000")
+        self.wf_evm_chunk_var    = tk.StringVar(value="256")
+        # Timing recovery (Gardner)
+        self.wf_timing_enabled_var = tk.BooleanVar(value=False)
+        self.wf_timing_alpha_var   = tk.StringVar(value="0.01")
+        self.wf_timing_beta_var    = tk.StringVar(value="0.0001")
+        self.wf_timing_init_var    = tk.StringVar(value="0.0")
+        self.wf_timing_auto_var    = tk.BooleanVar(value=True)
+        # Timing impairments (offset/drift/jitter) on samples
+        self.wf_ti_enabled_var     = tk.BooleanVar(value=False)
+        self.wf_ti_offset_var      = tk.StringVar(value="0.0")
+        self.wf_ti_drift_ppm_var   = tk.StringVar(value="0.0")
+        self.wf_ti_jitter_var      = tk.StringVar(value="0.0")
+        self.wf_ti_seed_var        = tk.StringVar(value="2026")
+        self.wf_ti_mode_var        = tk.StringVar(value="white")
+        self.wf_ti_bw_var          = tk.StringVar(value="0.01")
+        # Eye diagram
+        self.wf_eye_enabled_var    = tk.BooleanVar(value=False)
+        self.wf_eye_traces_var     = tk.StringVar(value="200")
+        # Phase noise (samples)
+        self.wf_pn_enabled_var     = tk.BooleanVar(value=False)
+        self.wf_pn_step_deg_var    = tk.StringVar(value="0.2")
+        self.wf_pn_seed_var        = tk.StringVar(value="777")
+        # ADC / AGC / clipping / quantization
+        self.wf_adc_enabled_var    = tk.BooleanVar(value=False)
+        self.wf_dc_enabled_var     = tk.BooleanVar(value=False)
+        self.wf_dc_i_var           = tk.StringVar(value="0.0")
+        self.wf_dc_q_var           = tk.StringVar(value="0.0")
+        self.wf_iq_enabled_var     = tk.BooleanVar(value=False)
+        self.wf_iq_amp_db_var      = tk.StringVar(value="0.5")
+        self.wf_iq_phase_deg_var   = tk.StringVar(value="3.0")
+        self.wf_agc_enabled_var    = tk.BooleanVar(value=True)
+        self.wf_agc_target_var     = tk.StringVar(value="1.0")
+        self.wf_agc_min_gain_var   = tk.StringVar(value="0.01")
+        self.wf_agc_max_gain_var   = tk.StringVar(value="100.0")
+        self.wf_clip_enabled_var   = tk.BooleanVar(value=True)
+        self.wf_clip_level_var     = tk.StringVar(value="1.2")
+        self.wf_q_enabled_var      = tk.BooleanVar(value=True)
+        self.wf_adc_bits_var       = tk.StringVar(value="10")
+        self.wf_adc_fs_var         = tk.StringVar(value="1.0")
+
         self.queue           = queue.Queue()
         self.progress_var    = tk.DoubleVar(value=0.0)
         self.progress_label_var = tk.StringVar(value="Готов")
@@ -267,6 +422,10 @@ class SimulationGUI:
 
         self.create_widgets()
         self.root.after(100, self.process_queue)
+        self._bind_hotkeys()
+
+        # Применяем профиль к UI-дефолтам после построения виджетов
+        self._apply_profile_to_ui(self.profile_var.get())
 
     # ── Стиль ─────────────────────────────────────────────────────────────────
 
@@ -277,13 +436,36 @@ class SimulationGUI:
         style.configure("Dark.TFrame",     background=DARK_BG)
         style.configure("TLabel",          background=PANEL_BG, foreground=TEXT_COLOR, font=("Segoe UI", 10))
         style.configure("Title.TLabel",    background=PANEL_BG, foreground=TEXT_LIGHT, font=("Segoe UI", 11, "bold"))
-        style.configure("TButton",         font=("Segoe UI", 10, "bold"), padding=6)
-        style.map("TButton", background=[("active", ACCENT_CYAN), ("pressed", ACCENT_GREEN)])
+        style.configure("TButton",         font=("Segoe UI", 10, "bold"), padding=7)
+        style.map("TButton", background=[("active", "#22304f"), ("pressed", "#243a66")])
+
+        # Более “современные” акцентные/опасные кнопки
+        style.configure("Accent.TButton",  background=ACCENT_CYAN, foreground="#000000")
+        style.map("Accent.TButton",
+                  background=[("active", "#4de7ff"), ("pressed", "#00b7d6"), ("disabled", "#2b4a5a")],
+                  foreground=[("disabled", "#94a3b8")])
+        style.configure("Danger.TButton",  background=ACCENT_PINK, foreground="#000000")
+        style.map("Danger.TButton",
+                  background=[("active", "#ff4f98"), ("pressed", "#d90060"), ("disabled", "#523041")],
+                  foreground=[("disabled", "#94a3b8")])
+        style.configure("Ghost.TButton",   background=PANEL_BG, foreground=TEXT_COLOR)
+        style.map("Ghost.TButton",
+                  background=[("active", "#1f2b4a"), ("pressed", "#22304f")])
+
         style.configure("TEntry",          fieldbackground="#1a1a2e", foreground=TEXT_COLOR, font=("Segoe UI", 10))
         style.configure("TCombobox",       fieldbackground="#1a1a2e", foreground=TEXT_COLOR, font=("Segoe UI", 10))
-        style.configure("Treeview",        background="#1a1a2e", fieldbackground="#1a1a2e", foreground=TEXT_COLOR, font=("Segoe UI", 9))
+        style.configure(
+            "Treeview",
+            background="#1a1a2e",
+            fieldbackground="#1a1a2e",
+            foreground=TEXT_COLOR,
+            font=("Segoe UI", 9),
+            rowheight=26,
+        )
         style.configure("Treeview.Heading", background=PANEL_BG, foreground=ACCENT_CYAN, font=("Segoe UI", 10, "bold"))
         style.map("Treeview", background=[("selected", ACCENT_CYAN)], foreground=[("selected", "#000000")])
+        style.configure("TPanedwindow", background=DARK_BG)
+        style.configure("Sash", sashthickness=6)
         style.configure("TNotebook",       background=DARK_BG)
         style.configure("TNotebook.Tab",   background=PANEL_BG, foreground=TEXT_COLOR, font=("Segoe UI", 10, "bold"), padding=[15, 8])
         style.map("TNotebook.Tab",         background=[("selected", ACCENT_CYAN)], foreground=[("selected", "#000000")])
@@ -292,6 +474,14 @@ class SimulationGUI:
         style.configure("TLabelframe",     background=PANEL_BG, foreground=ACCENT_CYAN, font=("Segoe UI", 10, "bold"))
         style.configure("TLabelframe.Label", background=PANEL_BG, foreground=ACCENT_CYAN)
         style.configure("TProgressbar",    background=ACCENT_CYAN, troughcolor="#1a1a2e")
+
+    def _bind_hotkeys(self) -> None:
+        # Горячие клавиши не должны ломать callbacks, которые не принимают event
+        self.root.bind("<Control-Return>", lambda e: (not self.running) and self.start_simulation())
+        self.root.bind("<Escape>",         lambda e: self.running and self.stop_simulation())
+        self.root.bind("<Control-s>",      lambda e: self.save_results())
+        self.root.bind("<Control-e>",      lambda e: self.export_results())
+        self.root.bind("<Control-l>",      lambda e: self.show_log())
 
     # ── Логирование ───────────────────────────────────────────────────────────
 
@@ -346,34 +536,36 @@ class SimulationGUI:
     # ── Виджеты ───────────────────────────────────────────────────────────────
 
     def create_widgets(self) -> None:
-        main = ttk.Frame(self.root, style="Dark.TFrame")
-        main.pack(fill=tk.BOTH, expand=True)
+        main = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL, style="TPanedwindow")
+        main.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
-        left = ttk.Frame(main, width=320)
-        left.pack(side=tk.LEFT, fill=tk.Y)
+        left = ttk.Frame(main, width=380, style="Dark.TFrame")
+        right = ttk.Frame(main, style="Dark.TFrame")
+        main.add(left, weight=0)
+        main.add(right, weight=1)
         left.pack_propagate(False)
-
-        right = ttk.Frame(main)
-        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8, pady=8)
 
         # Заголовок
         hdr = ttk.Frame(left, style="Dark.TFrame")
-        hdr.pack(fill=tk.X, padx=10, pady=10)
-        ttk.Label(hdr, text="⚙ КОНФИГУРАЦИЯ", style="Title.TLabel",
-                  foreground=ACCENT_CYAN).pack(anchor=tk.W)
+        hdr.pack(fill=tk.X, padx=12, pady=(12, 8))
+        ttk.Label(hdr, text="Симулятор цифровой связи", style="Title.TLabel",
+                  foreground=TEXT_LIGHT).pack(anchor=tk.W)
+        ttk.Label(hdr, text="Настройки и запуск моделирования", style="TLabel",
+                  foreground="#94a3b8", background=DARK_BG, font=("Segoe UI", 9)).pack(anchor=tk.W, pady=(2, 0))
 
         # Ноутбук с настройками
         nb = ttk.Notebook(left)
-        nb.pack(fill=tk.BOTH, expand=True, padx=8)
+        nb.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 8))
 
         tabs = [
-            ("📊 Данные",      self._build_data_tab),
-            ("🔐 Кодирование", self._build_coding_tab),
-            ("🔒 Шифрование",  self._build_encryption_tab),
-            ("📡 Модуляция",   self._build_mod_tab),
-            ("📶 Канал",       self._build_channel_tab),
-            ("📈 Графики",     self._build_plot_tab),
-            ("🔀 Перемежение",  self._build_interleaving_tab),
+            ("Данные",       self._build_data_tab),
+            ("Кодирование",  self._build_coding_tab),
+            ("Шифрование",   self._build_encryption_tab),
+            ("Модуляция",    self._build_mod_tab),
+            ("Канал",        self._build_channel_tab),
+            ("Сигнал",       self._build_waveform_tab),
+            ("Графики",      self._build_plot_tab),
+            ("Перемежение",  self._build_interleaving_tab),
         ]
         for title, builder in tabs:
             tab_outer = ttk.Frame(nb)
@@ -383,26 +575,33 @@ class SimulationGUI:
 
         # Кнопки управления
         btn_f = ttk.Frame(left)
-        btn_f.pack(fill=tk.X, padx=8, pady=8)
+        btn_f.pack(fill=tk.X, padx=10, pady=(0, 10))
 
-        self.start_btn = ttk.Button(btn_f, text="▶ СТАРТ", command=self.start_simulation)
+        self.start_btn = ttk.Button(btn_f, text="▶ Старт", command=self.start_simulation, style="Accent.TButton")
         self.start_btn.pack(fill=tk.X, pady=2)
-        self.stop_btn = ttk.Button(btn_f, text="⏹ СТОП", command=self.stop_simulation,
-                                   state=tk.DISABLED)
+        self.stop_btn = ttk.Button(btn_f, text="⏹ Стоп", command=self.stop_simulation,
+                                   state=tk.DISABLED, style="Danger.TButton")
         self.stop_btn.pack(fill=tk.X, pady=2)
-        ttk.Button(btn_f, text="💾 История", command=self.show_history).pack(fill=tk.X, pady=2)
-        ttk.Button(btn_f, text="📋 Логи",    command=self.show_log).pack(fill=tk.X, pady=2)
+        self.history_btn = ttk.Button(btn_f, text="История", command=self.show_history, style="Ghost.TButton")
+        self.history_btn.pack(fill=tk.X, pady=2)
+        self.logs_btn = ttk.Button(btn_f, text="Логи",    command=self.show_log, style="Ghost.TButton")
+        self.logs_btn.pack(fill=tk.X, pady=2)
+
+        ToolTip(self.start_btn, "Запуск симуляции.\nГорячая клавиша: Ctrl+Enter")
+        ToolTip(self.stop_btn, "Остановить текущий запуск.\nГорячая клавиша: Esc")
+        ToolTip(self.history_btn, "История запусков и загрузка сохранённых результатов.")
+        ToolTip(self.logs_btn, "Открыть текущий лог.\nГорячая клавиша: Ctrl+L")
 
         # Правая часть
-        ttk.Label(right, text="📈 РЕЗУЛЬТАТЫ", style="Title.TLabel",
-                  foreground=ACCENT_CYAN).pack(anchor=tk.W, pady=(0, 5))
+        ttk.Label(right, text="РЕЗУЛЬТАТЫ", style="Title.TLabel",
+                  foreground=ACCENT_CYAN).pack(anchor=tk.W, pady=(0, 6), padx=6)
         self.plot_frame = ttk.Frame(right)
-        self.plot_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+        self.plot_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10), padx=6)
 
-        ttk.Label(right, text="📊 МЕТРИКИ", style="Title.TLabel",
-                  foreground=ACCENT_CYAN).pack(anchor=tk.W, pady=(0, 5))
+        ttk.Label(right, text="МЕТРИКИ", style="Title.TLabel",
+                  foreground=ACCENT_CYAN).pack(anchor=tk.W, pady=(0, 6), padx=6)
         metrics_c = ttk.Frame(right, height=140)
-        metrics_c.pack(fill=tk.X, side=tk.BOTTOM)
+        metrics_c.pack(fill=tk.X, side=tk.BOTTOM, padx=6, pady=(0, 4))
         metrics_c.pack_propagate(False)
         self._build_metrics_table(metrics_c)
 
@@ -412,11 +611,11 @@ class SimulationGUI:
 
         left_ctrl = ttk.Frame(ctrl_f, style="Dark.TFrame")
         left_ctrl.pack(side=tk.LEFT)
-        ttk.Button(left_ctrl, text="💾 Сохранить", command=self.save_results).pack(side=tk.LEFT, padx=4)
-        ttk.Button(left_ctrl, text="🗑 Очистить",  command=self.clear_results).pack(side=tk.LEFT, padx=4)
-        ttk.Button(left_ctrl, text="📊 Экспорт",   command=self.export_results).pack(side=tk.LEFT, padx=4)
-        ttk.Button(left_ctrl, text="📁 CSV",        command=self.export_csv).pack(side=tk.LEFT, padx=4)
-        ttk.Button(left_ctrl, text="🔀 Сравнить",  command=self.compare_runs).pack(side=tk.LEFT, padx=4)
+        ttk.Button(left_ctrl, text="Сохранить", command=self.save_results).pack(side=tk.LEFT, padx=4)
+        ttk.Button(left_ctrl, text="Очистить",  command=self.clear_results).pack(side=tk.LEFT, padx=4)
+        ttk.Button(left_ctrl, text="Экспорт",   command=self.export_results).pack(side=tk.LEFT, padx=4)
+        ttk.Button(left_ctrl, text="CSV",       command=self.export_csv).pack(side=tk.LEFT, padx=4)
+        ttk.Button(left_ctrl, text="Сравнить",  command=self.compare_runs).pack(side=tk.LEFT, padx=4)
 
         right_ctrl = ttk.Frame(ctrl_f, style="Dark.TFrame")
         right_ctrl.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=(20, 0))
@@ -435,6 +634,32 @@ class SimulationGUI:
     # ── Вкладки конфигурации ──────────────────────────────────────────────────
 
     def _build_data_tab(self, parent: ttk.Frame) -> None:
+        # Профиль (presets)
+        ttk.Label(parent, text="Профиль:", style="Title.TLabel").pack(
+            anchor=tk.W, padx=10, pady=(10, 5)
+        )
+        pf = ttk.Frame(parent)
+        pf.pack(anchor=tk.W, padx=10, pady=(0, 10))
+        prof_cb = ttk.Combobox(
+            pf,
+            values=["fast", "balanced", "realistic"],
+            textvariable=self.profile_var,
+            width=14,
+            state="readonly",
+        )
+        prof_cb.pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Label(
+            pf,
+            text="fast: быстро • balanced: реализм без перегруза • realistic: максимум блоков",
+            foreground=ACCENT_YELLOW,
+            font=("Segoe UI", 8),
+        ).pack(side=tk.LEFT)
+
+        def _on_profile_change(*_: object) -> None:
+            self._apply_profile_to_ui(self.profile_var.get())
+
+        self.profile_var.trace_add("write", _on_profile_change)
+
         ttk.Label(parent, text="Режим генерации:", style="Title.TLabel").pack(
             anchor=tk.W, padx=10, pady=(10, 5))
         mf = ttk.Frame(parent)
@@ -514,6 +739,64 @@ class SimulationGUI:
         ttk.Entry(per_f, textvariable=self.per_packet_var, width=10).grid(row=1, column=1, padx=8, sticky=tk.W)
         ttk.Label(per_f, text="напр. 1024", foreground=ACCENT_YELLOW,
                   font=("Segoe UI", 8)).grid(row=1, column=2, sticky=tk.W)
+
+    def _apply_profile_to_ui(self, profile: str) -> None:
+        """
+        Проставляет дефолты «как в системе» в UI.
+        Важно: это именно пресет для удобства; пользователь всегда может потом переопределить руками.
+        """
+        p = (profile or "fast").lower().strip()
+        if p == "fast":
+            self.wf_enabled_var.set(False)
+            self.wf_cfo_enabled_var.set(False)
+            self.wf_timing_enabled_var.set(False)
+            return
+
+        if p == "balanced":
+            self.wf_enabled_var.set(True)
+            self.wf_sps_var.set("8")
+            self.wf_rrc_beta_var.set("0.35")
+            self.wf_rrc_span_var.set("10")
+
+            self.wf_cfo_enabled_var.set(True)
+            self.wf_cfo_norm_var.set("0.0")
+            self.wf_cfo_rec_var.set(True)
+            self.wf_cfo_preamble_var.set(True)
+            self.wf_cfo_prelen_var.set("64")
+            self.wf_cfo_loop_var.set("dd_pll")
+            self.wf_cfo_src_var.set("preamble")
+
+            self.wf_timing_enabled_var.set(True)
+            self.wf_timing_alpha_var.set("0.01")
+            self.wf_timing_beta_var.set("0.0001")
+            self.wf_timing_init_var.set("0.0")
+            self.wf_timing_auto_var.set(True)
+
+            # Balanced: тяжёлые/дорогие блоки оставляем выключенными
+            self.wf_tdl_enabled_var.set(False)
+            self.wf_eq_enabled_var.set(False)
+            self.wf_tr_enabled_var.set(False)
+            self.wf_pil_enabled_var.set(False)
+            self.wf_adc_enabled_var.set(False)
+            self.wf_pn_enabled_var.set(False)
+            self.wf_ti_enabled_var.set(False)
+            self.wf_eye_enabled_var.set(False)
+            return
+
+        if p == "realistic":
+            self.wf_enabled_var.set(True)
+            self.wf_cfo_enabled_var.set(True)
+            self.wf_cfo_norm_var.set("0.0005")
+            self.wf_cfo_rec_var.set(True)
+            self.wf_timing_enabled_var.set(True)
+            self.wf_tdl_enabled_var.set(True)
+            self.wf_eq_enabled_var.set(True)
+            self.wf_pil_enabled_var.set(True)
+            self.wf_adc_enabled_var.set(True)
+            self.wf_pn_enabled_var.set(True)
+            # В realistic можно оставить глаз выключенным, чтобы не тормозить UI
+            self.wf_eye_enabled_var.set(False)
+            return
 
     def _build_coding_tab(self, parent: ttk.Frame) -> None:
         ttk.Checkbutton(parent, text="✓ Включить кодирование",
@@ -718,7 +1001,8 @@ class SimulationGUI:
             vars_map: dict[str, tk.Variable] = {f"{key_prefix}_enabled": enabled_var}
             for label, var_key, var_type, default, widget_kwargs in fields:
                 ttk.Label(frame, text=label, font=("Segoe UI", 9)).pack(anchor=tk.W, pady=(4, 0))
-                var = (tk.StringVar if var_type == "str" else tk.StringVar)(value=str(default))
+                # В GUI храним всё как строки; преобразование делаем в build_config().
+                var = tk.StringVar(value=str(default))
                 widget_class = widget_kwargs.pop("__class__", ttk.Entry)
                 w = widget_class(frame, textvariable=var, **widget_kwargs)
                 w.pack(anchor=tk.W, pady=(0, 6))
@@ -737,30 +1021,41 @@ class SimulationGUI:
         # Phase Noise
         _vars, _ = _add_section(
             "🔄 Фазовый шум", "phase", [
-                ("Дисперсия фазы (rad²):", "variance", "str", "0.001", {"width": 15}),
+                # В channel.py ожидается std в градусах приращения фазы (phase_noise_std_deg).
+                ("СКО приращения фазы (град):", "std_deg", "str", "1.0", {"width": 15}),
             ]
         )
         self.channel_vars.update(_vars)
 
-        # Impulse Noise — сохраняем ссылку на frame чтобы добавить поля ширины
-        _vars, impulse_frame = _add_section(
-            "⚡ Импульсные помехи", "impulse", [
-                ("Вероятность помехи:", "prob",      "str", "0.001", {"width": 15}),
-                ("Амплитуда (σ):",      "amp",       "str", "10.0",  {"width": 15}),
+        # Impulse Noise (гибко: одиночные / случайные пачки / РЛС-пачки)
+        _vars, _ = _add_section(
+            "⚡ Импульсные помехи", "impulse_noise", [
+                ("Режим:", "mode", "str", "bernoulli", {
+                    "__class__": ttk.Combobox,
+                    "values": ("bernoulli", "random_bursts", "radar"),
+                    "state": "readonly",
+                    "width": 15,
+                }),
+                ("SNR импульса (дБ):", "snr_db", "str", "20.0", {"width": 15}),
+                # bernoulli
+                ("Вероятность импульса (p):", "prob", "str", "0.001", {"width": 15}),
+                # random_bursts
+                ("P старта пачки:", "burst_p", "str", "0.0001", {"width": 15}),
+                ("Длина пачки min:", "burst_len_min", "str", "4", {"__class__": ttk.Spinbox, "from_": 1, "to": 100000, "width": 10}),
+                ("Длина пачки max:", "burst_len_max", "str", "32", {"__class__": ttk.Spinbox, "from_": 1, "to": 100000, "width": 10}),
+                ("Пауза min (симв):", "gap_min", "str", "32", {"__class__": ttk.Spinbox, "from_": 0, "to": 100000, "width": 10}),
+                ("Пауза max (симв):", "gap_max", "str", "256", {"__class__": ttk.Spinbox, "from_": 0, "to": 100000, "width": 10}),
+                ("P импульса внутри пачки:", "inburst_p", "str", "1.0", {"width": 15}),
+                ("Ширина импульса (симв):", "width", "str", "1", {"__class__": ttk.Spinbox, "from_": 1, "to": 100000, "width": 10}),
+                # radar
+                ("Период пачки (симв):", "radar_period", "str", "2000", {"__class__": ttk.Spinbox, "from_": 1, "to": 10000000, "width": 10}),
+                ("Импульсов в пачке:", "radar_pulses", "str", "16", {"__class__": ttk.Spinbox, "from_": 1, "to": 100000, "width": 10}),
+                ("Шаг импульса (симв):", "radar_spacing", "str", "20", {"__class__": ttk.Spinbox, "from_": 1, "to": 100000, "width": 10}),
+                ("Ширина импульса (симв):", "radar_width", "str", "1", {"__class__": ttk.Spinbox, "from_": 1, "to": 100000, "width": 10}),
+                ("Джиттер (±симв):", "radar_jitter", "str", "0", {"__class__": ttk.Spinbox, "from_": 0, "to": 100000, "width": 10}),
             ]
         )
         self.channel_vars.update(_vars)
-        # Ширина импульса — дополнительная строка прямо в impulse_frame
-        w_frame = ttk.Frame(impulse_frame)
-        w_frame.pack(anchor=tk.W, pady=(0, 6))
-        ttk.Label(w_frame, text="Ширина: от").pack(side=tk.LEFT, padx=4)
-        wf_var = tk.StringVar(value="1")
-        ttk.Spinbox(w_frame, from_=1, to=20, textvariable=wf_var, width=6).pack(side=tk.LEFT, padx=4)
-        ttk.Label(w_frame, text="до").pack(side=tk.LEFT, padx=4)
-        wt_var = tk.StringVar(value="5")
-        ttk.Spinbox(w_frame, from_=1, to=20, textvariable=wt_var, width=6).pack(side=tk.LEFT, padx=4)
-        self.channel_vars["impulse_width_from"] = wf_var
-        self.channel_vars["impulse_width_to"]   = wt_var
 
 
     def _build_interleaving_tab(self, parent: ttk.Frame) -> None:
@@ -844,6 +1139,338 @@ class SimulationGUI:
             justify=tk.LEFT,
             font=("Segoe UI", 8),
         ).pack(padx=10, pady=(2, 0), anchor=tk.W)
+
+    def _build_waveform_tab(self, parent: ttk.Frame) -> None:
+        """
+        Вкладка «Сигнал»: дискретно-временная модель (sps>1, RRC, CFO).
+
+        Важно:
+          - При включении waveform-режима канал из вкладки «Канал» пока
+            применяется только в symbol-rate режиме (старом).
+          - В waveform-режиме текущий MVP: RRC(TX/RX) + AWGN (+CFO).
+        """
+        wf_f = ttk.LabelFrame(parent, text="📶 Waveform (sps + RRC)", padding=10)
+        wf_f.pack(fill=tk.X, padx=10, pady=(12, 8))
+
+        ttk.Checkbutton(
+            wf_f, text="✓ Включить дискретно-временной режим (sps>1)",
+            variable=self.wf_enabled_var,
+        ).grid(row=0, column=0, columnspan=3, sticky=tk.W, pady=(0, 8))
+
+        ttk.Label(wf_f, text="Отсчётов на символ (sps):").grid(row=1, column=0, sticky=tk.W, pady=4)
+        ttk.Combobox(
+            wf_f, textvariable=self.wf_sps_var,
+            values=["2", "4", "8", "16"], state="readonly", width=8,
+        ).grid(row=1, column=1, padx=8, sticky=tk.W)
+        ttk.Label(wf_f, text=">=2", foreground=ACCENT_YELLOW, font=("Segoe UI", 8)).grid(
+            row=1, column=2, sticky=tk.W
+        )
+
+        ttk.Label(wf_f, text="RRC roll-off (beta):").grid(row=2, column=0, sticky=tk.W, pady=4)
+        ttk.Entry(wf_f, textvariable=self.wf_rrc_beta_var, width=10).grid(
+            row=2, column=1, padx=8, sticky=tk.W
+        )
+        ttk.Label(wf_f, text="0..1 (напр. 0.35)", foreground=ACCENT_YELLOW, font=("Segoe UI", 8)).grid(
+            row=2, column=2, sticky=tk.W
+        )
+
+        ttk.Label(wf_f, text="RRC длина (span, символов):").grid(row=3, column=0, sticky=tk.W, pady=4)
+        ttk.Spinbox(
+            wf_f, from_=4, to=20, textvariable=self.wf_rrc_span_var, width=8,
+        ).grid(row=3, column=1, padx=8, sticky=tk.W)
+        ttk.Label(wf_f, text="типично 6..12", foreground=ACCENT_YELLOW, font=("Segoe UI", 8)).grid(
+            row=3, column=2, sticky=tk.W
+        )
+
+        cfo_f = ttk.LabelFrame(parent, text="🎛 CFO (carrier offset)", padding=10)
+        cfo_f.pack(fill=tk.X, padx=10, pady=(0, 8))
+
+        ttk.Checkbutton(
+            cfo_f, text="✓ Включить CFO",
+            variable=self.wf_cfo_enabled_var,
+        ).grid(row=0, column=0, columnspan=3, sticky=tk.W, pady=(0, 8))
+
+        ttk.Label(cfo_f, text="CFO norm (циклов/отсчёт):").grid(row=1, column=0, sticky=tk.W, pady=4)
+        ttk.Entry(cfo_f, textvariable=self.wf_cfo_norm_var, width=12).grid(
+            row=1, column=1, padx=8, sticky=tk.W
+        )
+        ttk.Label(
+            cfo_f,
+            text="напр. 0.001 (малое вращение)",
+            foreground=ACCENT_YELLOW, font=("Segoe UI", 8),
+        ).grid(row=1, column=2, sticky=tk.W)
+
+        ttk.Checkbutton(
+            cfo_f, text="✓ CFO recovery (PLL, decision-directed)",
+            variable=self.wf_cfo_rec_var,
+        ).grid(row=2, column=0, columnspan=3, sticky=tk.W, pady=(6, 4))
+
+        ttk.Label(cfo_f, text="Тип петли:").grid(row=3, column=0, sticky=tk.W, pady=4)
+        ttk.Combobox(
+            cfo_f, textvariable=self.wf_cfo_loop_var,
+            values=["dd_pll", "costas_mpsk"], state="readonly", width=12,
+        ).grid(row=3, column=1, padx=8, sticky=tk.W)
+        ttk.Label(
+            cfo_f, text="PSK: можно выбрать Costas",
+            foreground=ACCENT_YELLOW, font=("Segoe UI", 8),
+        ).grid(row=3, column=2, sticky=tk.W)
+
+        ttk.Label(cfo_f, text="Скорость петли (PLL):").grid(row=4, column=0, sticky=tk.W, pady=4)
+        ttk.Combobox(
+            cfo_f, textvariable=self.wf_pll_mode_var,
+            values=["slow", "medium", "fast"], state="readonly", width=10,
+        ).grid(row=4, column=1, padx=8, sticky=tk.W)
+        ttk.Label(
+            cfo_f, text="slow=стабильнее, fast=быстрее",
+            foreground=ACCENT_YELLOW, font=("Segoe UI", 8),
+        ).grid(row=4, column=2, sticky=tk.W)
+
+        ttk.Checkbutton(
+            cfo_f, text="✓ Переамбула для CFO (2 одинаковые половины)",
+            variable=self.wf_cfo_preamble_var,
+        ).grid(row=5, column=0, columnspan=3, sticky=tk.W, pady=(10, 4))
+
+        ttk.Label(cfo_f, text="Длина половины (символов):").grid(row=6, column=0, sticky=tk.W, pady=4)
+        ttk.Spinbox(
+            cfo_f, from_=16, to=512, increment=16,
+            textvariable=self.wf_cfo_prelen_var, width=8,
+        ).grid(row=6, column=1, padx=8, sticky=tk.W)
+        ttk.Label(
+            cfo_f, text="типично 32..128",
+            foreground=ACCENT_YELLOW, font=("Segoe UI", 8),
+        ).grid(row=6, column=2, sticky=tk.W)
+
+        ttk.Label(cfo_f, text="Estimator source:").grid(row=7, column=0, sticky=tk.W, pady=(8, 4))
+        ttk.Combobox(
+            cfo_f, textvariable=self.wf_cfo_src_var,
+            values=["training", "pilots", "pilots_track", "pilots_track_lin", "preamble", "blind"], state="readonly", width=12,
+        ).grid(row=7, column=1, padx=8, sticky=tk.W, pady=(8, 4))
+        ttk.Label(
+            cfo_f, text="выбор источника оценки CFO",
+            foreground=ACCENT_YELLOW, font=("Segoe UI", 8),
+        ).grid(row=7, column=2, sticky=tk.W, pady=(8, 4))
+
+        ttk.Label(
+            parent,
+            text=(
+                "Waveform-режим добавляет >1 отсчёта/символ и фильтры как в реальном PHY:\n"
+                "  symbols → upsample → RRC(TX) → [CFO] → AWGN → RRC(RX) → downsample → demod\n\n"
+                "Пока это MVP: без тайминг-синхронизации. Можно добавить TDL-многолучевой канал и эквалайзер.\n"
+                "Старый режим (symbol-rate) остаётся доступен при выключенном чекбоксе."
+            ),
+            justify=tk.LEFT, foreground=ACCENT_YELLOW,
+        ).pack(anchor=tk.W, padx=10, pady=10)
+
+        tdl_f = ttk.LabelFrame(parent, text="🌁 TDL многолучевой (на отсчётах)", padding=10)
+        tdl_f.pack(fill=tk.X, padx=10, pady=(0, 8))
+        ttk.Checkbutton(
+            tdl_f, text="✓ Включить TDL (свёртка FIR на отсчётах)",
+            variable=self.wf_tdl_enabled_var,
+        ).grid(row=0, column=0, columnspan=3, sticky=tk.W, pady=(0, 8))
+
+        ttk.Label(tdl_f, text="Задержки (символы):").grid(row=1, column=0, sticky=tk.W, pady=4)
+        ttk.Entry(tdl_f, textvariable=self.wf_tdl_delays_var, width=18).grid(row=1, column=1, padx=8, sticky=tk.W)
+        ttk.Label(tdl_f, text="напр. 0,1,3", foreground=ACCENT_YELLOW, font=("Segoe UI", 8)).grid(row=1, column=2, sticky=tk.W)
+
+        ttk.Label(tdl_f, text="Мощности путей (дБ):").grid(row=2, column=0, sticky=tk.W, pady=4)
+        ttk.Entry(tdl_f, textvariable=self.wf_tdl_powers_var, width=18).grid(row=2, column=1, padx=8, sticky=tk.W)
+        ttk.Label(tdl_f, text="напр. 0,-3,-6", foreground=ACCENT_YELLOW, font=("Segoe UI", 8)).grid(row=2, column=2, sticky=tk.W)
+
+        ttk.Label(tdl_f, text="Seed (пусто = случайно):").grid(row=3, column=0, sticky=tk.W, pady=4)
+        ttk.Entry(tdl_f, textvariable=self.wf_tdl_seed_var, width=10).grid(row=3, column=1, padx=8, sticky=tk.W)
+        ttk.Label(tdl_f, text="Дробн. задержки (frac taps):").grid(row=4, column=0, sticky=tk.W, pady=4)
+        ttk.Spinbox(tdl_f, from_=5, to=101, increment=2, textvariable=self.wf_tdl_frac_taps_var, width=8).grid(
+            row=4, column=1, padx=8, sticky=tk.W
+        )
+        ttk.Label(tdl_f, text="нечётное (напр. 21)", foreground=ACCENT_YELLOW, font=("Segoe UI", 8)).grid(
+            row=4, column=2, sticky=tk.W
+        )
+
+        eq_f = ttk.LabelFrame(parent, text="🧰 Эквалайзер (symbol-rate, без пилотов)", padding=10)
+        eq_f.pack(fill=tk.X, padx=10, pady=(0, 8))
+        ttk.Checkbutton(
+            eq_f, text="✓ Включить линейный эквалайзер",
+            variable=self.wf_eq_enabled_var,
+        ).grid(row=0, column=0, columnspan=3, sticky=tk.W, pady=(0, 8))
+
+        ttk.Label(eq_f, text="Тип:").grid(row=1, column=0, sticky=tk.W, pady=4)
+        ttk.Combobox(
+            eq_f, textvariable=self.wf_eq_kind_var,
+            values=["zf", "mmse"], state="readonly", width=10,
+        ).grid(row=1, column=1, padx=8, sticky=tk.W)
+        ttk.Label(eq_f, text="MMSE устойчивее при шуме", foreground=ACCENT_YELLOW, font=("Segoe UI", 8)).grid(row=1, column=2, sticky=tk.W)
+
+        ttk.Label(eq_f, text="Оценка канала:").grid(row=2, column=0, sticky=tk.W, pady=4)
+        ttk.Combobox(
+            eq_f, textvariable=self.wf_eq_est_var,
+            values=["ideal", "training_ls", "pilot_ls", "preamble_ls"], state="readonly", width=12,
+        ).grid(row=2, column=1, padx=8, sticky=tk.W)
+        ttk.Label(eq_f, text="training/pilot — отдельные настройки ниже", foreground=ACCENT_YELLOW, font=("Segoe UI", 8)).grid(
+            row=2, column=2, sticky=tk.W
+        )
+
+        ttk.Label(eq_f, text="Длина FIR (taps):").grid(row=2, column=0, sticky=tk.W, pady=4)
+        ttk.Spinbox(eq_f, from_=3, to=63, increment=2, textvariable=self.wf_eq_len_var, width=8).grid(row=2, column=1, padx=8, sticky=tk.W)
+
+        ttk.Label(eq_f, text="Delay (пусто = авто):").grid(row=3, column=0, sticky=tk.W, pady=4)
+        ttk.Entry(eq_f, textvariable=self.wf_eq_delay_var, width=10).grid(row=3, column=1, padx=8, sticky=tk.W)
+        ttk.Label(eq_f, text="обычно Lh-1", foreground=ACCENT_YELLOW, font=("Segoe UI", 8)).grid(row=3, column=2, sticky=tk.W)
+
+        ttk.Label(eq_f, text="Оценка taps канала (символов):").grid(row=4, column=0, sticky=tk.W, pady=4)
+        ttk.Spinbox(eq_f, from_=16, to=128, increment=8, textvariable=self.wf_eq_chan_taps_var, width=8).grid(row=4, column=1, padx=8, sticky=tk.W)
+
+        ttk.Label(eq_f, text="LS reg (для *_ls):").grid(row=5, column=0, sticky=tk.W, pady=4)
+        ttk.Entry(eq_f, textvariable=self.wf_eq_ls_reg_var, width=10).grid(row=5, column=1, padx=8, sticky=tk.W)
+        ttk.Label(eq_f, text="напр. 1e-3", foreground=ACCENT_YELLOW, font=("Segoe UI", 8)).grid(row=5, column=2, sticky=tk.W)
+
+        tr_f = ttk.LabelFrame(parent, text="🎯 Training sequence (оценка канала)", padding=10)
+        tr_f.pack(fill=tk.X, padx=10, pady=(0, 8))
+        ttk.Checkbutton(
+            tr_f, text="✓ Включить training в начале кадра",
+            variable=self.wf_tr_enabled_var,
+        ).grid(row=0, column=0, columnspan=3, sticky=tk.W, pady=(0, 8))
+        ttk.Label(tr_f, text="Длина (символов):").grid(row=1, column=0, sticky=tk.W, pady=4)
+        ttk.Spinbox(tr_f, from_=16, to=2048, increment=16, textvariable=self.wf_tr_len_var, width=8).grid(
+            row=1, column=1, padx=8, sticky=tk.W
+        )
+        ttk.Label(tr_f, text="типично 64..256", foreground=ACCENT_YELLOW, font=("Segoe UI", 8)).grid(row=1, column=2, sticky=tk.W)
+        ttk.Label(tr_f, text="Seed:").grid(row=2, column=0, sticky=tk.W, pady=4)
+        ttk.Entry(tr_f, textvariable=self.wf_tr_seed_var, width=12).grid(row=2, column=1, padx=8, sticky=tk.W)
+
+        pil_f = ttk.LabelFrame(parent, text="🧷 Пилоты в данных (каждые N символов)", padding=10)
+        pil_f.pack(fill=tk.X, padx=10, pady=(0, 8))
+        ttk.Checkbutton(
+            pil_f, text="✓ Вставлять пилоты в поток данных",
+            variable=self.wf_pil_enabled_var,
+        ).grid(row=0, column=0, columnspan=3, sticky=tk.W, pady=(0, 8))
+        ttk.Label(pil_f, text="Период (символов данных):").grid(row=1, column=0, sticky=tk.W, pady=4)
+        ttk.Entry(pil_f, textvariable=self.wf_pil_period_var, width=10).grid(row=1, column=1, padx=8, sticky=tk.W)
+        ttk.Label(pil_f, text="напр. 256", foreground=ACCENT_YELLOW, font=("Segoe UI", 8)).grid(row=1, column=2, sticky=tk.W)
+        ttk.Label(pil_f, text="Длина пилота (символов):").grid(row=2, column=0, sticky=tk.W, pady=4)
+        ttk.Entry(pil_f, textvariable=self.wf_pil_len_var, width=10).grid(row=2, column=1, padx=8, sticky=tk.W)
+        ttk.Label(pil_f, text="напр. 16", foreground=ACCENT_YELLOW, font=("Segoe UI", 8)).grid(row=2, column=2, sticky=tk.W)
+        ttk.Label(pil_f, text="Seed:").grid(row=3, column=0, sticky=tk.W, pady=4)
+        ttk.Entry(pil_f, textvariable=self.wf_pil_seed_var, width=12).grid(row=3, column=1, padx=8, sticky=tk.W)
+
+        plot_f = ttk.LabelFrame(parent, text="📈 Метрики / графики (waveform)", padding=10)
+        plot_f.pack(fill=tk.X, padx=10, pady=(0, 8))
+        ttk.Checkbutton(
+            plot_f, text="✓ Созвездие до/после EQ (для последней точки SNR)",
+            variable=self.wf_plot_const_var,
+        ).grid(row=0, column=0, columnspan=3, sticky=tk.W, pady=(0, 8))
+        ttk.Label(plot_f, text="Точек для scatter:").grid(row=1, column=0, sticky=tk.W, pady=4)
+        ttk.Entry(plot_f, textvariable=self.wf_const_points_var, width=10).grid(row=1, column=1, padx=8, sticky=tk.W)
+        ttk.Label(plot_f, text="100..20000", foreground=ACCENT_YELLOW, font=("Segoe UI", 8)).grid(row=1, column=2, sticky=tk.W)
+        ttk.Label(plot_f, text="EVM chunk (symbols):").grid(row=2, column=0, sticky=tk.W, pady=4)
+        ttk.Entry(plot_f, textvariable=self.wf_evm_chunk_var, width=10).grid(row=2, column=1, padx=8, sticky=tk.W)
+        ttk.Label(plot_f, text="напр. 256", foreground=ACCENT_YELLOW, font=("Segoe UI", 8)).grid(row=2, column=2, sticky=tk.W)
+
+        timing_f = ttk.LabelFrame(parent, text="⏱ Timing recovery (Gardner)", padding=10)
+        timing_f.pack(fill=tk.X, padx=10, pady=(0, 12))
+        ttk.Checkbutton(
+            timing_f, text="✓ Включить timing recovery (Gardner TED)",
+            variable=self.wf_timing_enabled_var,
+        ).grid(row=0, column=0, columnspan=3, sticky=tk.W, pady=(0, 8))
+        ttk.Label(timing_f, text="alpha:").grid(row=1, column=0, sticky=tk.W, pady=4)
+        ttk.Entry(timing_f, textvariable=self.wf_timing_alpha_var, width=10).grid(row=1, column=1, padx=8, sticky=tk.W)
+        ttk.Label(timing_f, text="напр. 0.01", foreground=ACCENT_YELLOW, font=("Segoe UI", 8)).grid(row=1, column=2, sticky=tk.W)
+        ttk.Label(timing_f, text="beta:").grid(row=2, column=0, sticky=tk.W, pady=4)
+        ttk.Entry(timing_f, textvariable=self.wf_timing_beta_var, width=10).grid(row=2, column=1, padx=8, sticky=tk.W)
+        ttk.Label(timing_f, text="напр. 1e-4", foreground=ACCENT_YELLOW, font=("Segoe UI", 8)).grid(row=2, column=2, sticky=tk.W)
+        ttk.Label(timing_f, text="init offset (samples):").grid(row=3, column=0, sticky=tk.W, pady=4)
+        ttk.Entry(timing_f, textvariable=self.wf_timing_init_var, width=10).grid(row=3, column=1, padx=8, sticky=tk.W)
+        ttk.Label(timing_f, text="0..sps (напр. 1.5)", foreground=ACCENT_YELLOW, font=("Segoe UI", 8)).grid(row=3, column=2, sticky=tk.W)
+        ttk.Checkbutton(
+            timing_f, text="✓ Auto init offset (по eye opening)",
+            variable=self.wf_timing_auto_var,
+        ).grid(row=4, column=0, columnspan=3, sticky=tk.W, pady=(8, 0))
+
+        ti_f = ttk.LabelFrame(parent, text="🧨 Timing impairments (offset/drift/jitter на отсчётах)", padding=10)
+        ti_f.pack(fill=tk.X, padx=10, pady=(0, 12))
+        ttk.Checkbutton(
+            ti_f, text="✓ Включить time-warp (ошибки дискретизации)",
+            variable=self.wf_ti_enabled_var,
+        ).grid(row=0, column=0, columnspan=3, sticky=tk.W, pady=(0, 8))
+        ttk.Label(ti_f, text="Offset (samples):").grid(row=1, column=0, sticky=tk.W, pady=4)
+        ttk.Entry(ti_f, textvariable=self.wf_ti_offset_var, width=10).grid(row=1, column=1, padx=8, sticky=tk.W)
+        ttk.Label(ti_f, text="напр. 1.5", foreground=ACCENT_YELLOW, font=("Segoe UI", 8)).grid(row=1, column=2, sticky=tk.W)
+        ttk.Label(ti_f, text="Drift (ppm):").grid(row=2, column=0, sticky=tk.W, pady=4)
+        ttk.Entry(ti_f, textvariable=self.wf_ti_drift_ppm_var, width=10).grid(row=2, column=1, padx=8, sticky=tk.W)
+        ttk.Label(ti_f, text="напр. 50", foreground=ACCENT_YELLOW, font=("Segoe UI", 8)).grid(row=2, column=2, sticky=tk.W)
+        ttk.Label(ti_f, text="Jitter std (samples):").grid(row=3, column=0, sticky=tk.W, pady=4)
+        ttk.Entry(ti_f, textvariable=self.wf_ti_jitter_var, width=10).grid(row=3, column=1, padx=8, sticky=tk.W)
+        ttk.Label(ti_f, text="напр. 0.05", foreground=ACCENT_YELLOW, font=("Segoe UI", 8)).grid(row=3, column=2, sticky=tk.W)
+        ttk.Label(ti_f, text="Jitter mode:").grid(row=4, column=0, sticky=tk.W, pady=4)
+        ttk.Combobox(
+            ti_f, textvariable=self.wf_ti_mode_var,
+            values=["white", "pll", "wiener"], state="readonly", width=10,
+        ).grid(row=4, column=1, padx=8, sticky=tk.W)
+        ttk.Label(ti_f, text="pll = коррелированный", foreground=ACCENT_YELLOW, font=("Segoe UI", 8)).grid(row=4, column=2, sticky=tk.W)
+        ttk.Label(ti_f, text="PLL bw norm:").grid(row=5, column=0, sticky=tk.W, pady=4)
+        ttk.Entry(ti_f, textvariable=self.wf_ti_bw_var, width=10).grid(row=5, column=1, padx=8, sticky=tk.W)
+        ttk.Label(ti_f, text="0..0.5 (напр. 0.01)", foreground=ACCENT_YELLOW, font=("Segoe UI", 8)).grid(row=5, column=2, sticky=tk.W)
+        ttk.Label(ti_f, text="Seed:").grid(row=6, column=0, sticky=tk.W, pady=4)
+        ttk.Entry(ti_f, textvariable=self.wf_ti_seed_var, width=10).grid(row=6, column=1, padx=8, sticky=tk.W)
+
+        eye_f = ttk.LabelFrame(parent, text="👁 Eye diagram", padding=10)
+        eye_f.pack(fill=tk.X, padx=10, pady=(0, 12))
+        ttk.Checkbutton(
+            eye_f, text="✓ Сохранять eye diagram до/после timing recovery (последняя точка SNR)",
+            variable=self.wf_eye_enabled_var,
+        ).grid(row=0, column=0, columnspan=3, sticky=tk.W, pady=(0, 8))
+        ttk.Label(eye_f, text="Трасс:").grid(row=1, column=0, sticky=tk.W, pady=4)
+        ttk.Entry(eye_f, textvariable=self.wf_eye_traces_var, width=10).grid(row=1, column=1, padx=8, sticky=tk.W)
+        ttk.Label(eye_f, text="20..2000", foreground=ACCENT_YELLOW, font=("Segoe UI", 8)).grid(row=1, column=2, sticky=tk.W)
+
+        pn_f = ttk.LabelFrame(parent, text="🌀 Phase noise (Wiener на отсчётах)", padding=10)
+        pn_f.pack(fill=tk.X, padx=10, pady=(0, 12))
+        ttk.Checkbutton(
+            pn_f, text="✓ Включить phase noise",
+            variable=self.wf_pn_enabled_var,
+        ).grid(row=0, column=0, columnspan=3, sticky=tk.W, pady=(0, 8))
+        ttk.Label(pn_f, text="Step std (deg/sample):").grid(row=1, column=0, sticky=tk.W, pady=4)
+        ttk.Entry(pn_f, textvariable=self.wf_pn_step_deg_var, width=10).grid(row=1, column=1, padx=8, sticky=tk.W)
+        ttk.Label(pn_f, text="напр. 0.2", foreground=ACCENT_YELLOW, font=("Segoe UI", 8)).grid(row=1, column=2, sticky=tk.W)
+        ttk.Label(pn_f, text="Seed:").grid(row=2, column=0, sticky=tk.W, pady=4)
+        ttk.Entry(pn_f, textvariable=self.wf_pn_seed_var, width=10).grid(row=2, column=1, padx=8, sticky=tk.W)
+
+        adc_f = ttk.LabelFrame(parent, text="🎚 AGC + Clipping + ADC (quantization)", padding=10)
+        adc_f.pack(fill=tk.X, padx=10, pady=(0, 12))
+        ttk.Checkbutton(
+            adc_f, text="✓ Включить ADC фронтенд (AGC/клиппинг/квантование)",
+            variable=self.wf_adc_enabled_var,
+        ).grid(row=0, column=0, columnspan=3, sticky=tk.W, pady=(0, 8))
+
+        ttk.Checkbutton(adc_f, text="DC offset", variable=self.wf_dc_enabled_var).grid(row=1, column=0, sticky=tk.W, pady=4)
+        ttk.Label(adc_f, text="dc_i:").grid(row=1, column=1, sticky=tk.W, pady=4)
+        ttk.Entry(adc_f, textvariable=self.wf_dc_i_var, width=10).grid(row=1, column=2, padx=8, sticky=tk.W)
+        ttk.Label(adc_f, text="dc_q:").grid(row=2, column=1, sticky=tk.W, pady=4)
+        ttk.Entry(adc_f, textvariable=self.wf_dc_q_var, width=10).grid(row=2, column=2, padx=8, sticky=tk.W)
+
+        ttk.Checkbutton(adc_f, text="IQ imbalance", variable=self.wf_iq_enabled_var).grid(row=3, column=0, sticky=tk.W, pady=4)
+        ttk.Label(adc_f, text="amp dB:").grid(row=3, column=1, sticky=tk.W, pady=4)
+        ttk.Entry(adc_f, textvariable=self.wf_iq_amp_db_var, width=10).grid(row=3, column=2, padx=8, sticky=tk.W)
+        ttk.Label(adc_f, text="phase deg:").grid(row=4, column=1, sticky=tk.W, pady=4)
+        ttk.Entry(adc_f, textvariable=self.wf_iq_phase_deg_var, width=10).grid(row=4, column=2, padx=8, sticky=tk.W)
+
+        ttk.Checkbutton(adc_f, text="AGC", variable=self.wf_agc_enabled_var).grid(row=5, column=0, sticky=tk.W, pady=4)
+        ttk.Label(adc_f, text="target RMS:").grid(row=5, column=1, sticky=tk.W, pady=4)
+        ttk.Entry(adc_f, textvariable=self.wf_agc_target_var, width=10).grid(row=5, column=2, padx=8, sticky=tk.W)
+
+        ttk.Label(adc_f, text="min gain:").grid(row=6, column=1, sticky=tk.W, pady=4)
+        ttk.Entry(adc_f, textvariable=self.wf_agc_min_gain_var, width=10).grid(row=6, column=2, padx=8, sticky=tk.W)
+        ttk.Label(adc_f, text="max gain:").grid(row=7, column=1, sticky=tk.W, pady=4)
+        ttk.Entry(adc_f, textvariable=self.wf_agc_max_gain_var, width=10).grid(row=7, column=2, padx=8, sticky=tk.W)
+
+        ttk.Checkbutton(adc_f, text="Clipping", variable=self.wf_clip_enabled_var).grid(row=8, column=0, sticky=tk.W, pady=4)
+        ttk.Label(adc_f, text="clip level:").grid(row=8, column=1, sticky=tk.W, pady=4)
+        ttk.Entry(adc_f, textvariable=self.wf_clip_level_var, width=10).grid(row=8, column=2, padx=8, sticky=tk.W)
+
+        ttk.Checkbutton(adc_f, text="Quantization", variable=self.wf_q_enabled_var).grid(row=9, column=0, sticky=tk.W, pady=4)
+        ttk.Label(adc_f, text="bits:").grid(row=9, column=1, sticky=tk.W, pady=4)
+        ttk.Entry(adc_f, textvariable=self.wf_adc_bits_var, width=10).grid(row=9, column=2, padx=8, sticky=tk.W)
+        ttk.Label(adc_f, text="full scale:").grid(row=10, column=1, sticky=tk.W, pady=4)
+        ttk.Entry(adc_f, textvariable=self.wf_adc_fs_var, width=10).grid(row=10, column=2, padx=8, sticky=tk.W)
 
     def _open_recovery_panel(self) -> None:
         """
@@ -1108,6 +1735,228 @@ class SimulationGUI:
         except ValueError:
             turbo_block = 128
 
+        # Waveform параметры (ошибки не фатальны — используем safe defaults)
+        try:
+            wf_sps = int(self.wf_sps_var.get())
+            if wf_sps < 2:
+                wf_sps = 8
+        except ValueError:
+            wf_sps = 8
+        try:
+            wf_beta = float(self.wf_rrc_beta_var.get())
+            if wf_beta < 0.0 or wf_beta > 1.0:
+                wf_beta = 0.35
+        except ValueError:
+            wf_beta = 0.35
+        try:
+            wf_span = int(self.wf_rrc_span_var.get())
+            if wf_span < 2:
+                wf_span = 10
+        except ValueError:
+            wf_span = 10
+        try:
+            wf_cfo_norm = float(self.wf_cfo_norm_var.get())
+        except ValueError:
+            wf_cfo_norm = 0.0
+
+        try:
+            wf_prelen = int(self.wf_cfo_prelen_var.get())
+            if wf_prelen < 8:
+                wf_prelen = 64
+        except ValueError:
+            wf_prelen = 64
+
+        def _parse_int_list(s: str, default: list[int]) -> list[int]:
+            if not s or not str(s).strip():
+                return list(default)
+            parts = [p.strip() for p in str(s).replace(";", ",").split(",") if p.strip()]
+            out: list[int] = []
+            for p in parts:
+                try:
+                    out.append(int(p))
+                except ValueError:
+                    return list(default)
+            return out or list(default)
+
+        def _parse_float_list(s: str, default: list[float]) -> list[float]:
+            if not s or not str(s).strip():
+                return list(default)
+            parts = [p.strip() for p in str(s).replace(";", ",").split(",") if p.strip()]
+            out: list[float] = []
+            for p in parts:
+                try:
+                    out.append(float(p))
+                except ValueError:
+                    return list(default)
+            return out or list(default)
+
+        # TDL + EQ (safe defaults)
+        tdl_delays = _parse_float_list(self.wf_tdl_delays_var.get(), [0.0, 1.0, 3.0])
+        tdl_powers = _parse_float_list(self.wf_tdl_powers_var.get(), [0.0, -3.0, -6.0])
+        try:
+            tdl_seed_str = (self.wf_tdl_seed_var.get() or "").strip()
+            tdl_seed = int(tdl_seed_str) if tdl_seed_str else None
+        except ValueError:
+            tdl_seed = None
+        try:
+            tdl_frac_taps = int(self.wf_tdl_frac_taps_var.get())
+        except ValueError:
+            tdl_frac_taps = 21
+        if tdl_frac_taps < 5:
+            tdl_frac_taps = 21
+        if tdl_frac_taps % 2 == 0:
+            tdl_frac_taps += 1
+
+        eq_kind = (self.wf_eq_kind_var.get() or "mmse").lower()
+        if eq_kind not in ("zf", "mmse"):
+            eq_kind = "mmse"
+        eq_est = (self.wf_eq_est_var.get() or "ideal").lower()
+        if eq_est not in ("ideal", "training_ls", "pilot_ls", "preamble_ls"):
+            eq_est = "ideal"
+        try:
+            eq_ls_reg = float(self.wf_eq_ls_reg_var.get())
+        except ValueError:
+            eq_ls_reg = 1e-3
+        if eq_ls_reg < 0:
+            eq_ls_reg = 1e-3
+        try:
+            eq_len = int(self.wf_eq_len_var.get())
+        except ValueError:
+            eq_len = 9
+        eq_len = max(1, min(63, eq_len))
+        try:
+            eq_delay_str = (self.wf_eq_delay_var.get() or "").strip()
+            eq_delay = int(eq_delay_str) if eq_delay_str else None
+        except ValueError:
+            eq_delay = None
+        try:
+            eq_chan_taps = int(self.wf_eq_chan_taps_var.get())
+        except ValueError:
+            eq_chan_taps = 32
+        eq_chan_taps = max(16, min(128, eq_chan_taps))
+
+        # training + pilots (safe defaults)
+        try:
+            tr_len = int(self.wf_tr_len_var.get())
+        except ValueError:
+            tr_len = 128
+        tr_len = max(16, min(4096, tr_len))
+        try:
+            tr_seed = int((self.wf_tr_seed_var.get() or "12345").strip())
+        except ValueError:
+            tr_seed = 12345
+        try:
+            pil_period = int(self.wf_pil_period_var.get())
+        except ValueError:
+            pil_period = 256
+        pil_period = max(16, min(1000000, pil_period))
+        try:
+            pil_len = int(self.wf_pil_len_var.get())
+        except ValueError:
+            pil_len = 16
+        pil_len = max(4, min(2048, pil_len))
+        try:
+            pil_seed = int((self.wf_pil_seed_var.get() or "4242").strip())
+        except ValueError:
+            pil_seed = 4242
+
+        try:
+            const_pts = int(self.wf_const_points_var.get())
+        except ValueError:
+            const_pts = 2000
+        const_pts = max(100, min(20000, const_pts))
+        try:
+            evm_chunk = int(self.wf_evm_chunk_var.get())
+        except ValueError:
+            evm_chunk = 256
+        evm_chunk = max(32, min(8192, evm_chunk))
+
+        try:
+            tr_alpha = float(self.wf_timing_alpha_var.get())
+        except ValueError:
+            tr_alpha = 0.01
+        try:
+            tr_beta = float(self.wf_timing_beta_var.get())
+        except ValueError:
+            tr_beta = 0.0001
+        try:
+            tr_init = float(self.wf_timing_init_var.get())
+        except ValueError:
+            tr_init = 0.0
+
+        # timing impairments + eye diagram
+        try:
+            ti_offset = float(self.wf_ti_offset_var.get())
+        except ValueError:
+            ti_offset = 0.0
+        try:
+            ti_drift_ppm = float(self.wf_ti_drift_ppm_var.get())
+        except ValueError:
+            ti_drift_ppm = 0.0
+        try:
+            ti_jitter = float(self.wf_ti_jitter_var.get())
+        except ValueError:
+            ti_jitter = 0.0
+        try:
+            ti_seed = int((self.wf_ti_seed_var.get() or "").strip())
+        except ValueError:
+            ti_seed = 2026
+        ti_mode = (self.wf_ti_mode_var.get() or "white").lower()
+        if ti_mode not in ("white", "pll", "wiener"):
+            ti_mode = "white"
+        try:
+            ti_bw = float(self.wf_ti_bw_var.get())
+        except ValueError:
+            ti_bw = 0.01
+        if ti_bw < 0:
+            ti_bw = 0.01
+        try:
+            eye_traces = int(self.wf_eye_traces_var.get())
+        except ValueError:
+            eye_traces = 200
+        eye_traces = max(20, min(2000, eye_traces))
+
+        # phase noise (samples) safe defaults
+        try:
+            pn_step_deg = float(self.wf_pn_step_deg_var.get())
+        except ValueError:
+            pn_step_deg = 0.2
+        try:
+            pn_seed = int((self.wf_pn_seed_var.get() or "").strip())
+        except ValueError:
+            pn_seed = 777
+
+        # ADC/AGC/clip/quant safe defaults
+        def _flt(s: str, default: float) -> float:
+            try:
+                return float(s)
+            except ValueError:
+                return float(default)
+        def _intv(s: str, default: int) -> int:
+            try:
+                return int(s)
+            except ValueError:
+                return int(default)
+
+        agc_target = _flt(self.wf_agc_target_var.get(), 1.0)
+        agc_min_g  = _flt(self.wf_agc_min_gain_var.get(), 0.01)
+        agc_max_g  = _flt(self.wf_agc_max_gain_var.get(), 100.0)
+        clip_level = _flt(self.wf_clip_level_var.get(), 1.2)
+        adc_bits   = _intv(self.wf_adc_bits_var.get(), 10)
+        adc_fs     = _flt(self.wf_adc_fs_var.get(), 1.0)
+        dc_i       = _flt(self.wf_dc_i_var.get(), 0.0)
+        dc_q       = _flt(self.wf_dc_q_var.get(), 0.0)
+        iq_amp_db  = _flt(self.wf_iq_amp_db_var.get(), 0.0)
+        iq_phi_deg = _flt(self.wf_iq_phase_deg_var.get(), 0.0)
+
+        pll_mode = (self.wf_pll_mode_var.get() or "medium").lower()
+        if pll_mode == "slow":
+            pll_alpha, pll_beta = 0.01, 0.0001
+        elif pll_mode == "fast":
+            pll_alpha, pll_beta = 0.05, 0.0012
+        else:
+            pll_alpha, pll_beta = 0.02, 0.0004
+
         cv = self.channel_vars
         channel_config = {
             "awgn":             {"enabled": True},
@@ -1118,14 +1967,25 @@ class SimulationGUI:
             },
             "phase_noise": {
                 "enabled":              cv["phase_enabled"].get(),
-                "phase_noise_variance": float(cv["phase_variance"].get()),
+                "phase_noise_std_deg":  float(cv["phase_std_deg"].get()),
             },
             "impulse_noise": {
-                "enabled":                  cv["impulse_enabled"].get(),
-                "impulse_probability":      float(cv["impulse_prob"].get()),
-                "impulse_amplitude_sigma":  float(cv["impulse_amp"].get()),
-                "impulse_width_from":       int(cv["impulse_width_from"].get()),
-                "impulse_width_to":         int(cv["impulse_width_to"].get()),
+                "enabled":             cv["impulse_noise_enabled"].get(),
+                "mode":                      cv["impulse_noise_mode"].get(),
+                "impulse_snr_dB":            float(cv["impulse_noise_snr_db"].get()),
+                "impulse_probability":       float(cv["impulse_noise_prob"].get()),
+                "burst_start_probability":   float(cv["impulse_noise_burst_p"].get()),
+                "burst_len_min":             int(cv["impulse_noise_burst_len_min"].get()),
+                "burst_len_max":             int(cv["impulse_noise_burst_len_max"].get()),
+                "burst_gap_min":             int(cv["impulse_noise_gap_min"].get()),
+                "burst_gap_max":             int(cv["impulse_noise_gap_max"].get()),
+                "in_burst_pulse_probability": float(cv["impulse_noise_inburst_p"].get()),
+                "pulse_width_symbols":       int(cv["impulse_noise_width"].get()),
+                "radar_burst_period_symbols":  int(cv["impulse_noise_radar_period"].get()),
+                "radar_pulses_per_burst":      int(cv["impulse_noise_radar_pulses"].get()),
+                "radar_pulse_spacing_symbols": int(cv["impulse_noise_radar_spacing"].get()),
+                "radar_pulse_width_symbols":   int(cv["impulse_noise_radar_width"].get()),
+                "radar_pulse_jitter_symbols":  int(cv["impulse_noise_radar_jitter"].get()),
             },
         }
 
@@ -1136,6 +1996,7 @@ class SimulationGUI:
         rs_prim  = int(self.rs_prim_var.get(), 16)   # шестнадцатеричный ввод
 
         return {
+            "profile": self.profile_var.get(),
             "simulation_mode": self.mode_var.get(),
             "modulation": {
                 "type":          self.modulation_type_var.get(),
@@ -1183,6 +2044,98 @@ class SimulationGUI:
             "interleaving": {
                 "enabled": self.il_enabled_var.get(),
                 "depth":   int(self.il_depth_var.get()),
+            },
+            "waveform": {
+                "enabled":          self.wf_enabled_var.get(),
+                "sps":              wf_sps,
+                "rrc_beta":         wf_beta,
+                "rrc_span_symbols": wf_span,
+                "cfo": {
+                    "enabled":  self.wf_cfo_enabled_var.get(),
+                    "cfo_norm": wf_cfo_norm,
+                    "recovery_enabled": self.wf_cfo_rec_var.get(),
+                    "pll_alpha": pll_alpha,
+                    "pll_beta":  pll_beta,
+                    "preamble_enabled": self.wf_cfo_preamble_var.get(),
+                    "preamble_half_len_symbols": wf_prelen,
+                    "loop_type": (self.wf_cfo_loop_var.get() or "dd_pll"),
+                    "estimation_source": (self.wf_cfo_src_var.get() or "preamble"),
+                },
+                "tdl": {
+                    "enabled": self.wf_tdl_enabled_var.get(),
+                    "delays_symbols": tdl_delays,
+                    "powers_dB": tdl_powers,
+                    "fading": "rayleigh",
+                    "seed": tdl_seed,
+                    "frac_taps": tdl_frac_taps,
+                },
+                "equalizer": {
+                    "enabled": self.wf_eq_enabled_var.get(),
+                    "kind": eq_kind,
+                    "eq_len": eq_len,
+                    "delay": eq_delay,
+                    "channel_taps": eq_chan_taps,
+                    "estimation": eq_est,
+                    "ls_reg": eq_ls_reg,
+                },
+                "training": {
+                    "enabled": self.wf_tr_enabled_var.get(),
+                    "length_symbols": tr_len,
+                    "seed": tr_seed,
+                },
+                "pilots": {
+                    "enabled": self.wf_pil_enabled_var.get(),
+                    "period_symbols": pil_period,
+                    "length_symbols": pil_len,
+                    "seed": pil_seed,
+                },
+                "plots": {
+                    "constellation": self.wf_plot_const_var.get(),
+                    "constellation_points": const_pts,
+                    "eye_diagram": self.wf_eye_enabled_var.get(),
+                    "eye_traces": eye_traces,
+                    "evm_chunk_symbols": evm_chunk,
+                },
+                "timing": {
+                    "enabled": self.wf_timing_enabled_var.get(),
+                    "method": "gardner",
+                    "alpha": tr_alpha,
+                    "beta": tr_beta,
+                    "init_offset_samples": tr_init,
+                    "auto_init": self.wf_timing_auto_var.get(),
+                },
+                "timing_impairments": {
+                    "enabled": self.wf_ti_enabled_var.get(),
+                    "offset_samples": ti_offset,
+                    "drift_ppm": ti_drift_ppm,
+                    "jitter_std_samples": ti_jitter,
+                    "seed": ti_seed,
+                    "jitter_mode": ti_mode,
+                    "jitter_pll_bw_norm": ti_bw,
+                },
+                "phase_noise": {
+                    "enabled": self.wf_pn_enabled_var.get(),
+                    "step_std_deg": pn_step_deg,
+                    "seed": pn_seed,
+                },
+                "adc": {
+                    "enabled": self.wf_adc_enabled_var.get(),
+                    "dc_enabled": self.wf_dc_enabled_var.get(),
+                    "dc_i": dc_i,
+                    "dc_q": dc_q,
+                    "iq_imbalance_enabled": self.wf_iq_enabled_var.get(),
+                    "iq_amp_imbalance_db": iq_amp_db,
+                    "iq_phase_imbalance_deg": iq_phi_deg,
+                    "agc_enabled": self.wf_agc_enabled_var.get(),
+                    "agc_target_rms": agc_target,
+                    "agc_min_gain": agc_min_g,
+                    "agc_max_gain": agc_max_g,
+                    "clipping_enabled": self.wf_clip_enabled_var.get(),
+                    "clip_level": clip_level,
+                    "quantization_enabled": self.wf_q_enabled_var.get(),
+                    "n_bits": adc_bits,
+                    "full_scale": adc_fs,
+                },
             },
 
         }
@@ -1508,10 +2461,17 @@ class SimulationGUI:
 
             for r in results:
                 cer = f"{r.get('cer', 0):.2f}" if r.get("cer", 0) else "—"
+                epf = r.get("error_propagation_factor", 1.0)
+                epf_str = f"{epf:.2f}" if r.get("encryption_enabled") else "—"
+                ber_post = r.get("ber_post_decrypt", r.get("ber", 0))
                 self.tree.insert("", tk.END, values=(
-                    f"{r['snr']:.1f}", f"{r['ber']:.2e}", f"{r['ser']:.2e}",
+                    f"{r['snr']:.1f}",
+                    f"{r['ber']:.2e}",
+                    f"{ber_post:.2e}",
+                    f"{r.get('ser', 0):.2e}",
                     f"{r.get('theoretical_ber', 0):.2e}",
-                    f"{r.get('theoretical_ser', 0):.2e}", cer,
+                    epf_str,
+                    cer,
                 ))
 
             try:
